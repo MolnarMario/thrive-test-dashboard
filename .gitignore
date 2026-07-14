@@ -1,0 +1,4 @@
+node_modules/
+data/
+reporter-smoke/
+*.log

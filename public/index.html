@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Thrive Test Automator</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">
+          <img src="thrive-automation-logo.png" alt="Thrive Test Automator" />
+        </span>
+        <span class="brand-text">
+          <span class="brand-title">Thrive Test Automator</span>
+          <span class="brand-sub">runner · history · PR builder</span>
+        </span>
+      </div>
+      <nav class="tabs">
+        <button class="tab active" data-tab="run">Run</button>
+        <button class="tab" data-tab="live">Live<span id="liveBadge" class="badge hidden">0</span></button>
+        <button class="tab" data-tab="history">History</button>
+        <button class="tab" data-tab="calendar">Calendar</button>
+        <button class="tab" data-tab="schedules">Schedules</button>
+        <button class="tab" data-tab="prbuilder">PR Builder</button>
+      </nav>
+      <div class="env" id="envInfo"></div>
+    </header>
+
+    <main>
+      <!-- RUN TAB -->
+      <section id="tab-run" class="tabpane active">
+        <div class="run-toolbar">
+          <div class="left">
+            <button id="btnExpandAll" class="ghost">Expand all</button>
+            <button id="btnCollapseAll" class="ghost">Collapse all</button>
+            <button id="btnClear" class="ghost">Clear selection</button>
+            <button id="btnRefreshTree" class="ghost" title="Rescan suite for specs">↻ Rescan</button>
+            <button id="btnCheckSites" class="ghost" title="Ping LocalWP sites">◎ Check sites</button>
+          </div>
+          <div class="right">
+            <input id="grepInput" type="text" placeholder="Filter by keyword (--grep), optional" />
+            <span id="selCount" class="sel-count">0 specs selected</span>
+            <button id="btnRun" class="primary" disabled>Run selected ▶</button>
+          </div>
+        </div>
+        <div id="runError" class="error-banner hidden"></div>
+        <div id="tree" class="tree">Loading test tree…</div>
+      </section>
+
+      <!-- LIVE TAB -->
+      <section id="tab-live" class="tabpane">
+        <div id="activeList" class="active-list"></div>
+        <div id="liveEmpty" class="empty">No run selected. Start one from the Run tab, or pick an active run above.</div>
+        <div id="liveView" class="hidden"></div>
+      </section>
+
+      <!-- HISTORY TAB -->
+      <section id="tab-history" class="tabpane">
+        <div id="historyFilters" class="filter-bar">
+          <input id="hSearch" type="text" placeholder="Search label / site…" />
+          <select id="hStatus">
+            <option value="">All statuses</option>
+            <option value="passed">Passed</option>
+            <option value="failed">Failed</option>
+            <option value="error">Error</option>
+            <option value="cancelled">Cancelled</option>
+            <option value="interrupted">Interrupted</option>
+            <option value="running">Running</option>
+          </select>
+          <select id="hSite"><option value="">All sites</option></select>
+          <span id="hCount" class="sel-count"></span>
+        </div>
+        <div id="historyList" class="history-list">Loading…</div>
+        <div id="historyDetail" class="history-detail hidden"></div>
+      </section>
+
+      <!-- CALENDAR TAB -->
+      <section id="tab-calendar" class="tabpane">
+        <div class="cal-toolbar">
+          <button id="calPrev" class="ghost">←</button>
+          <span id="calMonth" class="cal-month"></span>
+          <button id="calNext" class="ghost">→</button>
+          <button id="calToday" class="ghost">Today</button>
+          <span class="cal-legend">
+            <span class="dot dot-pass"></span> passed
+            <span class="dot dot-partial"></span> partial
+            <span class="dot dot-fail"></span> failed
+            <span class="dot dot-other"></span> other
+          </span>
+        </div>
+        <div id="calGrid" class="cal-grid"></div>
+        <div id="calDay" class="cal-day"></div>
+      </section>
+
+      <!-- SCHEDULES TAB -->
+      <section id="tab-schedules" class="tabpane">
+        <div class="sched-head">
+          <h3>Scheduled runs</h3>
+          <button id="btnNewSchedule" class="primary">+ New schedule</button>
+        </div>
+        <p class="muted-note">node-cron fires only while the dashboard is running. Keep it open (or launch it at logon) for unattended runs.</p>
+        <div id="scheduleForm" class="sched-form hidden"></div>
+        <div id="scheduleList" class="sched-list">Loading…</div>
+      </section>
+
+      <!-- PR BUILDER TAB -->
+      <section id="tab-prbuilder" class="tabpane">
+        <div class="prb-layout">
+          <div class="prb-form">
+            <h3>Build a PR onto <code id="prbSite">…</code></h3>
+            <div id="prbError" class="error-banner hidden"></div>
+
+            <label>Milestone <span class="muted">(optional — filters PRs)</span></label>
+            <select id="prbMilestone"><option value="">— Recent open PRs —</option></select>
+
+            <label>PR</label>
+            <select id="prbPr"><option value="">— pick a PR —</option></select>
+
+            <label>PR Number</label>
+            <input id="prbPrNumber" type="text" inputmode="numeric" placeholder="e.g. 3752" />
+
+            <label>Version <span class="muted">(optional)</span></label>
+            <input id="prbVersion" type="text" placeholder="100.PR<N>" />
+
+            <label>Build scope</label>
+            <select id="prbScope">
+              <option value="smart">Smart pick — only what this PR touches</option>
+              <option value="all">All 12 products (full suite)</option>
+            </select>
+            <div id="prbScopeInfo" class="prb-scope-info"></div>
+
+            <label class="prb-check"><input type="checkbox" id="prbClean" /> Clean WP plugins folder first</label>
+            <label class="prb-check sub"><input type="checkbox" id="prbKeepTpm" checked /> keep Thrive Product Manager</label>
+            <label class="prb-check"><input type="checkbox" id="prbForce" checked /> Force clean build (wipe release cache)</label>
+
+            <div class="prb-actions">
+              <button id="prbBuild" class="primary">Build &amp; Install ▶</button>
+              <button id="prbCancel" class="danger hidden">Cancel</button>
+            </div>
+            <p class="muted-note">The site must be running in Local before you build (we can't start it for you).</p>
+          </div>
+
+          <div class="prb-right">
+            <div class="prb-log-head">
+              <span id="prbStatus" class="stat"></span>
+              <span class="spacer"></span>
+              <a id="prbAdmin" class="report-link hidden" target="_blank" rel="noopener">↗ Open wp-admin</a>
+              <button id="prbClearLog" class="ghost">Clear</button>
+            </div>
+            <pre id="prbLog" class="prb-log"></pre>
+            <div id="prbVerify" class="prb-verify hidden"></div>
+          </div>
+        </div>
+
+        <div class="prb-runtests">
+          <h3>Run tests on <code id="prbTestSite">…</code></h3>
+          <p class="muted-note">Runs the suite against the PR-built site (single-site mode). The site must be running in Local. Results appear in <b>Live</b> and <b>History</b>.</p>
+          <div id="prbTestError" class="error-banner hidden"></div>
+          <div class="prb-test-scope">
+            <label class="prb-radio"><input type="radio" name="prbTestScope" value="built" checked /> Built products' tests <span id="prbBuiltInfo" class="muted"></span></label>
+            <label class="prb-radio"><input type="radio" name="prbTestScope" value="areas" /> Specific products…</label>
+            <label class="prb-radio"><input type="radio" name="prbTestScope" value="all" /> All tests</label>
+          </div>
+          <div id="prbAreas" class="prb-areas hidden"></div>
+          <div class="prb-test-row">
+            <input id="prbTestGrep" type="text" placeholder="Keyword filter (--grep), e.g. 1997 — optional" />
+            <button id="prbRunTests" class="primary">Run tests ▶</button>
+          </div>
+        </div>
+
+        <h3 class="prb-history-head">Recent builds</h3>
+        <div id="prbHistory" class="history-list">Loading…</div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
