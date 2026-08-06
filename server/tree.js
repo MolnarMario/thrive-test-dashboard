@@ -5,7 +5,7 @@
  *
  * For each configured site we walk its testDirs under .playwright/tests and
  * produce a nested folder/file tree. Every node carries a `filter` string
- * (e.g. "tests/thrive-architect/Pages/") that can be passed directly to
+ * (e.g. "tests/site-a/Pages/") that can be passed directly to
  * Playwright as a positional argument — Playwright matches it as a substring
  * of the full spec path, which is exactly how run-parallel.sh targets dirs.
  */

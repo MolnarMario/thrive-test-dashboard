@@ -1,0 +1,29 @@
+{
+  "_comment": "Copy to pr-builder.config.json and edit. Each project is a WordPress plugin/theme repo the PR Builder can build onto a Local site.",
+  "projects": {
+    "dummy-plugin": {
+      "name": "Dummy Plugin",
+      "repo": "owner/dummy-wp-plugin",
+      "kind": "plugin",
+      "slug": "dummy-wp-plugin",
+      "site": "pr-builder-4platform.local",
+      "build": null,
+      "distDir": null,
+      "exclude": [".git", ".github", "node_modules", "tests"],
+      "testAreas": ["site-a"],
+      "versionStamp": true
+    },
+    "built-plugin-example": {
+      "name": "Plugin With A Build Step",
+      "repo": "owner/some-built-plugin",
+      "kind": "plugin",
+      "slug": "some-built-plugin",
+      "site": "pr-builder-4platform.local",
+      "build": "npm ci && npm run build",
+      "distDir": "dist",
+      "exclude": [".git", ".github", "node_modules", "src", "tests"],
+      "testAreas": ["site-b"],
+      "versionStamp": true
+    }
+  }
+}

@@ -36,7 +36,7 @@ const procs = new Map();
 const busySites = new Map();
 /** `${runId}:${site}` -> planned test list (live-only; not persisted) */
 const plans = new Map();
-/** `${runId}:${site}` -> child env overrides (THRIVE_SITE, or single-site
+/** `${runId}:${site}` -> child env overrides (TEST_SITE, or single-site
  *  PLAYWRIGHT_BASE_URL + creds). Kept off the run record so creds aren't persisted. */
 const spawnEnvs = new Map();
 
@@ -129,7 +129,7 @@ function startRun(targets, label) {
     totals: emptyTotals(),
     targets: targets.map((t) => {
       // Custom = single-site run against an explicit baseUrl (the PR-built site);
-      // otherwise a configured THRIVE_SITE.
+      // otherwise a configured TEST_SITE.
       const custom = !!t.baseUrl;
       const cfg = custom ? null : SITES[t.site];
       const paths =
@@ -138,7 +138,7 @@ function startRun(targets, label) {
           : (cfg ? cfg.testDirs.map((d) => `tests/${d}/`) : ['tests/']);
       spawnEnvs.set(`${id}:${t.site}`, custom
         ? { PLAYWRIGHT_BASE_URL: t.baseUrl, ...(t.env || {}) }
-        : { THRIVE_SITE: t.site });
+        : { TEST_SITE: t.site });
       return {
         site: t.site,
         name: custom ? (t.name || t.site) : cfg.name,

@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const express = require('express');
 
-const { PORT, RUNS_DIR, SUITE_DIR, PLAYWRIGHT_CLI, PR_BUILDER } = require('../config');
+const { PORT, RUNS_DIR, SUITE_DIR, PLAYWRIGHT_CLI } = require('../config');
 const store = require('./store');
 const tree = require('./tree');
 const orchestrator = require('./orchestrator');
@@ -143,7 +143,6 @@ app.get('/api/env', (_req, res) => {
   res.json({
     suiteDir: SUITE_DIR,
     playwrightCliExists: fs.existsSync(PLAYWRIGHT_CLI),
-    prBuilderSite: PR_BUILDER.siteDomain,
   });
 });
 
@@ -214,13 +213,13 @@ app.delete('/api/schedules/:id', (req, res) => {
   res.json({ deleted: true });
 });
 
-// --- PR Builder (build a thrive-themes PR onto the designated Local site) ---
+// --- PR Builder (build a configured plugin/theme PR onto its Local site) ---
 
-app.get('/api/prbuilder/milestones', async (_req, res) => {
+app.get('/api/prbuilder/projects', (_req, res) => {
   try {
-    res.json({ milestones: await prbuilder.listMilestones() });
+    res.json({ projects: prbuilder.listProjects() });
   } catch (err) {
-    res.status(502).json({ error: String(err.message || err) });
+    res.status(500).json({ error: String(err.message || err) });
   }
 });
 
@@ -228,20 +227,13 @@ app.get('/api/prbuilder/prs', async (req, res) => {
   try {
     res.json({
       prs: await prbuilder.listPRs({
-        milestoneTitle: req.query.milestone || undefined,
+        project: req.query.project || undefined,
+        state: req.query.state || undefined,
         limit: req.query.limit,
       }),
     });
   } catch (err) {
     res.status(502).json({ error: String(err.message || err) });
-  }
-});
-
-app.get('/api/prbuilder/recommend', async (req, res) => {
-  try {
-    res.json(await prbuilder.recommend(req.query.pr));
-  } catch (err) {
-    res.status(400).json({ error: String(err.message || err) });
   }
 });
 
@@ -342,7 +334,7 @@ tree.getTree().catch(() => {});
 
 app.listen(PORT, () => {
   // eslint-disable-next-line no-console
-  console.log(`\n  Thrive Test Dashboard → http://localhost:${PORT}\n`);
+  console.log(`\n  Automation Test Platform → http://localhost:${PORT}\n`);
   if (!fs.existsSync(PLAYWRIGHT_CLI)) {
     console.warn(
       `  WARNING: Playwright CLI not found at:\n    ${PLAYWRIGHT_CLI}\n` +

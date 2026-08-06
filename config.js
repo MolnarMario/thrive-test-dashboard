@@ -25,8 +25,8 @@ function resolveSuiteDir() {
   if (process.env.DASHBOARD_SUITE_DIR) return process.env.DASHBOARD_SUITE_DIR;
   const marker = path.join('.playwright', 'sites.config.ts');
   const candidates = [
-    path.resolve(__dirname, '..', 'thrive-themes-automated-tests'),
-    path.resolve(__dirname, '..', 'thrive-themes-automated-tests', 'thrive-themes-automated-tests'),
+    path.resolve(__dirname, '..', 'automated-tests'),
+    path.resolve(__dirname, '..', 'automated-tests', 'automated-tests'),
     path.resolve(__dirname, '..'),
   ];
   for (const c of candidates) {
@@ -46,65 +46,42 @@ const TESTS_ROOT_REL = '.playwright/tests';
 /**
  * Site key -> { name, url, testDirs }
  * testDirs are relative to the tests root and are used both for building the
- * test tree and as Playwright positional filters (e.g. "tests/thrive-architect/").
+ * test tree and as Playwright positional filters (e.g. "tests/site-a/").
+ *
+ * Loaded from sites.config.json in the dashboard root if present (gitignored —
+ * that's where your real site list lives; copy sites.config.example.json to
+ * get started). Falls back to a small generic example below so the dashboard
+ * still runs out of the box.
  */
-const SITES = {
-  architect: {
-    name: 'Thrive Architect',
-    url: 'https://for-automation-testing-tcb.local',
-    testDirs: ['thrive-architect'],
-  },
-  apprentice: {
-    name: 'Thrive Apprentice',
-    url: 'https://for-automation-testing-tva.local',
-    testDirs: ['thrive-apprentice'],
-  },
-  ttb: {
-    name: 'Thrive Theme Builder',
-    url: 'https://for-automation-testing-ttb.local',
-    testDirs: ['thrive-theme-builder'],
-  },
-  leads: {
-    name: 'Thrive Leads',
-    url: 'https://for-automation-testing-tl.local',
-    testDirs: ['thrive-leads'],
-  },
-  quiz: {
-    name: 'Thrive Quiz Builder',
-    url: 'https://for-automation-testing-tqb.local',
-    testDirs: ['thrive-quiz-builder'],
-  },
-  optimize: {
-    name: 'Thrive Optimize',
-    url: 'https://for-automation-testing-tab.local',
-    testDirs: ['thrive-ab-page-testing'],
-  },
-  ultimatum: {
-    name: 'Thrive Ultimatum',
-    url: 'https://for-automation-testing-tu.local',
-    testDirs: ['thrive-ultimatum'],
-  },
-  comments: {
-    name: 'Thrive Comments',
-    url: 'https://for-automation-testing-tcm.local',
-    testDirs: ['thrive-comments'],
-  },
-  ovation: {
-    name: 'Thrive Ovation',
-    url: 'https://for-automation-testing-tvo.local',
-    testDirs: ['thrive-ovation'],
-  },
-  tpm: {
-    name: 'Thrive Product Manager',
-    url: 'https://for-automation-testing-tpm.local',
-    testDirs: ['thrive-product-manager'],
-  },
-  main: {
-    name: 'Main (WordPress + cross-plugin)',
-    url: 'https://for-automation-testing.local',
-    testDirs: ['WordPress-specific', 'cross-plugin'],
-  },
-};
+function loadSites() {
+  const sitesConfigPath = path.join(__dirname, 'sites.config.json');
+  if (fs.existsSync(sitesConfigPath)) {
+    try {
+      return JSON.parse(fs.readFileSync(sitesConfigPath, 'utf8'));
+    } catch (err) {
+      throw new Error(`Failed to parse sites.config.json: ${err.message}`);
+    }
+  }
+  return {
+    'site-a': {
+      name: 'Site A',
+      url: 'https://site-a.local',
+      testDirs: ['site-a'],
+    },
+    'site-b': {
+      name: 'Site B',
+      url: 'https://site-b.local',
+      testDirs: ['site-b'],
+    },
+    main: {
+      name: 'Main (cross-site)',
+      url: 'https://main.local',
+      testDirs: ['cross-site'],
+    },
+  };
+}
+
+const SITES = loadSites();
 
 // Playwright CLI entry point inside the suite (spawned via `node <cli.js>`).
 const PLAYWRIGHT_CLI = path.join(
@@ -136,33 +113,27 @@ const MAX_CONCURRENT_SITES = Number(process.env.MAX_CONCURRENT_SITES ?? 0);
 
 /**
  * Sites started first (in this order), regardless of selection order. Any site
- * not listed keeps its original relative order after these. The listed four are
- * the largest/longest suites, so they get the freest memory and the most runway.
+ * not listed keeps its original relative order after these. List your
+ * largest/longest suites first so they get the freest memory and most runway.
  */
 const SITE_START_PRIORITY = (process.env.SITE_START_PRIORITY
   ? process.env.SITE_START_PRIORITY.split(',').map((s) => s.trim()).filter(Boolean)
-  : ['apprentice', 'architect', 'ttb', 'quiz']);
+  : []);
 
 /* ----------------------------- PR Builder ------------------------------- */
 /**
- * Config for the PR Builder tab — builds an awesomemotive/thrive-themes PR and
- * installs it onto a designated Local site, mirroring the LocalWP add-on.
+ * Config for the PR Builder tab — builds a GitHub PR for a configured WordPress
+ * plugin/theme and installs it onto that project's Local site.
  *
- * The worktree + release-tool cache are shared with the add-on's home dir so
- * warm builds reuse its node_modules/.cache (no multi-minute cold install).
- * Build history/logs live under the dashboard's own data/ dir.
+ * *Which* repos can be built is declared per project in `pr-builder.config.json`
+ * (see server/pr-projects.js). This block holds only the machine-level bits that
+ * are the same for every project. Build history/logs live under data/.
  */
 const PR_BUILDER = {
-  // The single designated target site (per project decision). Resolved to its
-  // web root + MySQL port from Local's sites.json at build time (localenv.js).
-  siteDomain: process.env.PR_BUILDER_SITE || 'pr-builder-4platform.local',
-
-  // Shared with the add-on so its warm worktree/cache are reused.
-  home: path.join(os.homedir(), '.local-addon-thrive-pr-builder'),
-  get worktree() {
-    return path.join(this.home, 'worktree');
-  },
-  releaseToolRel: 'tools/thrive-release',
+  // Per-project git checkouts live under here:
+  //   <home>/<projectKey>/repo      — the clone (fetches PR heads)
+  //   <home>/<projectKey>/worktree  — detached worktree reset to the PR head
+  home: process.env.PR_BUILDER_HOME || path.join(os.homedir(), '.wp-pr-builder'),
 
   // Vendored wp-cli, run under Local's bundled PHP (see localenv.buildWpCli).
   wpCliPhar: path.join(__dirname, 'vendor', 'wp-cli.phar'),
@@ -177,8 +148,8 @@ const PR_BUILDER = {
   buildsDir: path.join(DATA_DIR, 'pr-builds'),
 
   // Credentials for running the test suite against the PR-built site in
-  // single-site mode (PLAYWRIGHT_BASE_URL). pr-builder-4platform uses admin/admin;
-  // the suite reads these env vars (defaults admin / 'Admin123!').
+  // single-site mode (PLAYWRIGHT_BASE_URL). The suite reads these env vars
+  // (its own defaults are admin / 'Admin123!').
   testEnv: {
     WP_ADMIN_USERNAME: process.env.PR_BUILDER_WP_USER || 'admin',
     WP_ADMIN_PASSWORD: process.env.PR_BUILDER_WP_PASS || 'admin',

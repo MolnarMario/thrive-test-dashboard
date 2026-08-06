@@ -1,0 +1,17 @@
+{
+  "site-a": {
+    "name": "Site A",
+    "url": "https://site-a.local",
+    "testDirs": ["site-a"]
+  },
+  "site-b": {
+    "name": "Site B",
+    "url": "https://site-b.local",
+    "testDirs": ["site-b"]
+  },
+  "main": {
+    "name": "Main (cross-site)",
+    "url": "https://main.local",
+    "testDirs": ["cross-site"]
+  }
+}

@@ -1,27 +1,25 @@
-# Thrive Test Dashboard
+# Automation Test Platform
 
-A local web UI to run the Thrive Themes Playwright suites, watch live progress,
-and browse a history of past runs. It wraps the same per-site
-`THRIVE_SITE=<key> playwright test <dir>` runs that `scripts/run-parallel.sh`
-does — it never modifies the test suite.
+A local web UI to run Playwright test suites, watch live progress, and browse
+a history of past runs. It wraps per-site `TEST_SITE=<key> playwright test
+<dir>` runs — it never modifies the test suite itself.
 
 See [PLAN.md](./PLAN.md) for the full design and roadmap.
 
 ## Quick start
 
 ```bash
-cd "C:\Users\Mario\Local Sites\test-dashboard"
 npm install        # installs express (only dependency)
 npm start          # → http://localhost:4400
 ```
 
 Then open **http://localhost:4400**.
 
-Prerequisites (same as running the suite by hand):
+Prerequisites:
 
-- The relevant **LocalWP sites must be running** before you start a run.
-- The suite at `../thrive-themes-automated-tests/thrive-themes-automated-tests`
-  must have its `node_modules` installed (it does).
+- The sites you want to test **must be running** before you start a run.
+- The Playwright suite (see `DASHBOARD_SUITE_DIR` below) must have its
+  `node_modules` installed.
 
 ## How it works
 
@@ -35,16 +33,49 @@ Prerequisites (same as running the suite by hand):
 - **History tab** — every run is recorded under `data/runs/<id>/`. Click a run
   to see per-site results, failures, and a link to that site's full Playwright
   HTML report (with traces/screenshots).
+- **PR Builder tab** — paste a GitHub PR number or link for a configured
+  plugin/theme project; it builds that PR and installs it onto the project's
+  Local site, then lets you run the suite against it (see below).
+
+## PR Builder
+
+Builds a PR for a WordPress plugin/theme repo and installs it onto a
+[Local](https://localwp.com/) site, so you can run tests against the PR.
+
+Copy [`pr-builder.config.example.json`](./pr-builder.config.example.json) to
+`pr-builder.config.json` (gitignored) and describe your repos:
+
+| field | meaning |
+| --- | --- |
+| `repo` | GitHub `owner/name` — used for `gh` calls and cloning |
+| `kind` | `plugin` or `theme` → installs under `wp-content/plugins` or `.../themes` |
+| `slug` | install folder name |
+| `site` | Local site domain to install onto (per project) |
+| `build` | optional shell command run in the worktree; `null` for plain PHP plugins |
+| `distDir` | optional worktree subdir that *is* the plugin, if the build emits one |
+| `exclude` | paths never copied to the site |
+| `testAreas` | keys from your sites config whose tests run after a build |
+| `versionStamp` | rewrite the installed copy's `Version:` header to include the PR number |
+
+Requirements: the [`gh` CLI](https://cli.github.com/) authenticated
+(`gh auth status`) — this is also how private repos are cloned — and the target
+site **already running in Local** (the dashboard can't start it for you).
+
+Checkouts live under `~/.wp-pr-builder/<project>/` (override with
+`PR_BUILDER_HOME`); build records and logs under `data/pr-builds/`.
 
 ## Configuration
 
-Edit `config.js`, or set env vars:
-
-- `DASHBOARD_SUITE_DIR` — path to the Playwright suite root.
+- `DASHBOARD_SUITE_DIR` — path to the Playwright suite root (the folder
+  containing `package.json` + `.playwright/`). If unset, the dashboard looks
+  for an `automated-tests` folder next to it, then falls back to its own
+  parent directory.
 - `PORT` — HTTP port (default `4400`).
-
-The `SITES` map mirrors the suite's `.playwright/sites.config.ts`. If a site is
-added there, add it here too.
+- **Sites** — copy [`sites.config.example.json`](./sites.config.example.json)
+  to `sites.config.json` (gitignored) in the dashboard root and edit it to
+  match your suite's `.playwright/sites.config.ts`. Each entry is
+  `key: { name, url, testDirs }`. If `sites.config.json` is missing, a small
+  generic example is used so the dashboard still runs out of the box.
 
 ## Data layout
 

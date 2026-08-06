@@ -8,7 +8,7 @@
  * collects every test without running anything (~6s for the whole ~1000-file
  * suite), which is the authoritative count. We parse one line per test:
  *
- *   [chromium] › thrive-ovation\Admin\foo.spec.ts:9:6 › Suite › test title
+ *   [chromium] › site-a\Admin\foo.spec.ts:9:6 › Suite › test title
  *
  * and bucket by file. Keys are normalised to match the tree's file `filter`
  * (`tests/<dir>/.../<file>.spec.ts`) so the tree can attach counts directly.
@@ -32,7 +32,7 @@ function parse(stdout) {
   for (const raw of stdout.split('\n')) {
     const m = raw.match(LINE_RE);
     if (!m) continue;
-    // Path is relative to the tests root (e.g. "thrive-ovation\Admin\foo.spec.ts");
+    // Path is relative to the tests root (e.g. "site-a\Admin\foo.spec.ts");
     // the tree's file filter is "tests/" + that, with forward slashes.
     const key = 'tests/' + m[1].trim().replace(/\\/g, '/');
     counts[key] = (counts[key] || 0) + 1;
@@ -43,13 +43,13 @@ function parse(stdout) {
 
 function runList() {
   return new Promise((resolve) => {
-    // THRIVE_SITE just satisfies the suite config during collection; which
+    // TEST_SITE just satisfies the suite config during collection; which
     // tests exist doesn't depend on it, so one list covers every site.
-    const site = Object.keys(SITES)[0] || 'architect';
+    const site = Object.keys(SITES)[0] || 'site-a';
     const child = spawn(
       process.execPath,
       [PLAYWRIGHT_CLI, 'test', `--config=${PLAYWRIGHT_CONFIG}`, '--list'],
-      { cwd: SUITE_DIR, env: { ...process.env, THRIVE_SITE: site }, windowsHide: true }
+      { cwd: SUITE_DIR, env: { ...process.env, TEST_SITE: site }, windowsHide: true }
     );
     let out = '';
     child.stdout.on('data', (d) => (out += d.toString()));

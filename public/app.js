@@ -1366,23 +1366,17 @@ function showScheduleForm() {
 
 /* -------------------------------- PR Builder ------------------------------- */
 
-const PRB = { prs: [], lastRecommend: null };
+const PRB = { projects: [], prs: [] };
 let prbBound = false;
 let prbSource = null;
 let prbActiveId = null;
 
 async function loadPrBuilder() {
   bindPrb();
-  try {
-    const env = await api('/api/env');
-    $('#prbSite').textContent = env.prBuilderSite || '(site)';
-    $('#prbTestSite').textContent = env.prBuilderSite || '(site)';
-  } catch (_) {}
   if (!TREE) await loadTree(); // need the site list for the test-area checkboxes
   renderPrbAreas();
   updatePrbTestScope();
-  await prbLoadMilestones();
-  await prbLoadPRs();
+  await prbLoadProjects(); // also loads that project's PRs
   prbRefreshActive();
   prbLoadHistory();
 }
@@ -1390,17 +1384,12 @@ async function loadPrBuilder() {
 function bindPrb() {
   if (prbBound) return;
   prbBound = true;
-  $('#prbMilestone').addEventListener('change', prbLoadPRs);
+  $('#prbProject').addEventListener('change', onProjectPick);
   $('#prbPr').addEventListener('change', onPrPick);
-  $('#prbPrNumber').addEventListener('input', () => { updateVersionPlaceholder(); maybeRecommend(); });
-  $('#prbScope').addEventListener('change', updateScopeInfo);
-  $('#prbClean').addEventListener('change', () => {
-    $('#prbKeepTpm').closest('label').style.display = $('#prbClean').checked ? '' : 'none';
-  });
+  $('#prbPrNumber').addEventListener('input', updateVersionPlaceholder);
   $('#prbBuild').addEventListener('click', prbStartBuild);
   $('#prbCancel').addEventListener('click', prbCancel);
   $('#prbClearLog').addEventListener('click', () => { $('#prbLog').textContent = ''; });
-  $('#prbKeepTpm').closest('label').style.display = 'none'; // shown only when cleanWP
   $$('input[name="prbTestScope"]').forEach((r) => r.addEventListener('change', updatePrbTestScope));
   $('#prbRunTests').addEventListener('click', prbRunTests);
 }
@@ -1431,19 +1420,16 @@ function prbTestError(msg) {
 async function prbRunTests() {
   $('#prbTestError').classList.add('hidden');
   const scope = prbTestScope();
+  const project = currentProject();
   const grep = $('#prbTestGrep').value.trim() || undefined;
-  const body = { grep };
+  const body = { grep, project: project ? project.key : undefined };
   if (scope === 'all') {
     body.all = true;
   } else if (scope === 'areas') {
     body.areas = $$('#prbAreas input:checked').map((c) => c.value);
-    if (!body.areas.length) return prbTestError('Pick at least one product, or choose another scope.');
-  } else { // built products from the most recent build
-    if (!PRB.lastBuildProducts || !PRB.lastBuildProducts.length) {
-      return prbTestError('No build found yet — build a PR first, or pick specific products / all tests.');
-    }
-    body.products = PRB.lastBuildProducts;
+    if (!body.areas.length) return prbTestError('Pick at least one area, or choose another scope.');
   }
+  // scope === 'project' → server falls back to the project's configured testAreas.
   try {
     const { id } = await api('/api/prbuilder/test', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1455,30 +1441,70 @@ async function prbRunTests() {
   }
 }
 
-async function prbLoadMilestones() {
-  const sel = $('#prbMilestone');
-  if (sel.dataset.loaded) return;
+/** The project currently selected in the dropdown. */
+function currentProject() {
+  const key = $('#prbProject').value;
+  return PRB.projects.find((p) => p.key === key) || PRB.projects[0] || null;
+}
+
+async function prbLoadProjects() {
+  const sel = $('#prbProject');
   try {
-    const { milestones } = await api('/api/prbuilder/milestones');
-    for (const m of milestones) {
-      sel.append(el('option', { value: m.title }, `${m.title} (${m.openIssues} open)`));
+    const { projects } = await api('/api/prbuilder/projects');
+    PRB.projects = projects;
+    sel.innerHTML = '';
+    if (!projects.length) {
+      sel.append(el('option', { value: '' }, '(none configured)'));
+      return prbError('No projects configured. Copy pr-builder.config.example.json to pr-builder.config.json and edit it.');
     }
-    sel.dataset.loaded = '1';
-  } catch (_) { /* gh slow / offline — leave default */ }
+    for (const p of projects) sel.append(el('option', { value: p.key }, `${p.name} — ${p.repo}`));
+    if (projects[0] && projects[0].usingExample) {
+      prbError('Using pr-builder.config.example.json — copy it to pr-builder.config.json and point it at your own repos.');
+    }
+    await onProjectPick();
+  } catch (e) {
+    sel.innerHTML = '';
+    sel.append(el('option', { value: '' }, '(could not load projects)'));
+    prbError(e.message);
+  }
+}
+
+async function onProjectPick() {
+  const p = currentProject();
+  if (!p) return;
+  $('#prbSite').textContent = p.site;
+  $('#prbTestSite').textContent = p.site;
+
+  const info = $('#prbProjectInfo');
+  info.innerHTML = '';
+  const folder = p.kind === 'theme' ? 'themes' : 'plugins';
+  info.append(el('span', {}, `installs to wp-content/${folder}/${p.slug}`));
+  if (p.build) info.append(el('span', { class: 'muted' }, ` · build: ${p.build}`));
+  if (p.distDir) info.append(el('span', { class: 'muted' }, ` · dist: ${p.distDir}`));
+
+  const built = $('#prbBuiltInfo');
+  if (built) {
+    built.textContent = p.testAreas && p.testAreas.length
+      ? `· ${p.testAreas.join(', ')}`
+      : '· (no testAreas configured)';
+  }
+  await prbLoadPRs();
 }
 
 async function prbLoadPRs() {
   const sel = $('#prbPr');
+  const p = currentProject();
+  if (!p) { sel.innerHTML = '<option value="">—</option>'; return; }
   sel.innerHTML = '<option value="">Loading PRs…</option>';
-  const ms = $('#prbMilestone').value;
   try {
-    const { prs } = await api('/api/prbuilder/prs?limit=100' + (ms ? `&milestone=${encodeURIComponent(ms)}` : ''));
+    const { prs } = await api(`/api/prbuilder/prs?limit=100&project=${encodeURIComponent(p.key)}`);
     PRB.prs = prs;
     sel.innerHTML = '<option value="">— pick a PR —</option>';
-    for (const p of prs) {
-      const tag = p.state === 'MERGED' ? '✓ merged' : p.state === 'CLOSED' ? '✗ closed' : 'open';
-      sel.append(el('option', { value: String(p.number) }, `#${p.number} [${tag}] ${p.title}`));
+    for (const x of prs) {
+      const tag = x.state === 'MERGED' ? '✓ merged' : x.state === 'CLOSED' ? '✗ closed' : 'open';
+      sel.append(el('option', { value: String(x.number) }, `#${x.number} [${tag}] ${x.title}`));
     }
+    if (!prs.length) sel.innerHTML = '<option value="">(no open PRs)</option>';
   } catch (e) {
     sel.innerHTML = `<option value="">(could not load PRs: ${e.message})</option>`;
   }
@@ -1489,65 +1515,36 @@ function onPrPick() {
   if (!n) return;
   $('#prbPrNumber').value = n;
   updateVersionPlaceholder();
-  maybeRecommend();
+}
+
+/** Pull a PR number out of whatever the user typed (number, #n, or a URL). */
+function prNumberFromInput() {
+  const raw = $('#prbPrNumber').value.trim();
+  const url = raw.match(/\/pull\/(\d+)/);
+  if (url) return url[1];
+  const qualified = raw.match(/#(\d+)$/);
+  if (qualified) return qualified[1];
+  const bare = raw.match(/^#?(\d+)$/);
+  return bare ? bare[1] : null;
 }
 
 function updateVersionPlaceholder() {
-  const n = $('#prbPrNumber').value.trim();
+  const n = prNumberFromInput();
   $('#prbVersion').placeholder = n ? `100.PR${n}` : '100.PR<N>';
-}
-
-function updateScopeInfo() {
-  if ($('#prbScope').value === 'all') {
-    $('#prbScopeInfo').textContent = 'Builds all 12 products (slow).';
-    PRB.lastRecommend = null;
-  } else {
-    maybeRecommend();
-  }
-}
-
-async function maybeRecommend() {
-  const info = $('#prbScopeInfo');
-  const n = $('#prbPrNumber').value.trim();
-  if ($('#prbScope').value !== 'smart' || !/^\d+$/.test(n)) {
-    info.textContent = '';
-    PRB.lastRecommend = null;
-    return;
-  }
-  info.textContent = 'Analyzing PR diff…';
-  try {
-    const r = await api(`/api/prbuilder/recommend?pr=${n}`);
-    PRB.lastRecommend = { pr: n, products: r.products };
-    const deps = r.products.filter((p) => !r.directlyImpacted.includes(p));
-    info.innerHTML =
-      `<b>${r.totalFiles}</b> changed file(s) → build <b>${r.products.length}</b> product(s): ${r.products.join(', ')}` +
-      (deps.length ? `<br><span class="muted">+ build deps: ${deps.join(', ')}</span>` : '');
-  } catch (e) {
-    info.textContent = 'Could not analyze PR: ' + e.message;
-    PRB.lastRecommend = null;
-  }
 }
 
 async function prbStartBuild() {
   $('#prbError').classList.add('hidden');
-  const prNumber = $('#prbPrNumber').value.trim();
-  if (!/^\d+$/.test(prNumber)) return prbError('Enter a numeric PR number.');
+  const pr = $('#prbPrNumber').value.trim();
+  if (!pr) return prbError('Enter a PR number or link.');
+  const project = currentProject();
 
-  const scope = $('#prbScope').value;
   const payload = {
-    prNumber,
+    pr,
+    project: project ? project.key : undefined,
     version: $('#prbVersion').value.trim() || undefined,
-    cleanWP: $('#prbClean').checked,
-    keepTPM: $('#prbKeepTpm').checked,
-    forceClean: $('#prbForce').checked,
+    cleanInstall: $('#prbClean').checked,
   };
-  if (scope === 'all') {
-    payload.scope = 'all';
-  } else {
-    if (!PRB.lastRecommend || PRB.lastRecommend.pr !== prNumber) await maybeRecommend();
-    payload.scope = 'custom';
-    payload.products = (PRB.lastRecommend && PRB.lastRecommend.products) || [];
-  }
 
   try {
     const { id } = await api('/api/prbuilder/build', {
@@ -1615,6 +1612,7 @@ function prbSetStatus(build) {
   const s = $('#prbStatus');
   s.innerHTML = '';
   s.append(stBadge(build.status));
+  if (build.project && build.project.name) s.append(el('span', { class: 'stat' }, ` ${build.project.name}`));
   if (build.prNumber) s.append(el('span', { class: 'stat' }, ` PR #${build.prNumber}`));
   if (build.durationMs != null) s.append(el('span', { class: 'stat' }, ' ⏱ ' + fmtDuration(build.durationMs)));
   const admin = $('#prbAdmin');
@@ -1636,10 +1634,12 @@ function prbRenderVerify(build) {
   box.append(el('div', { class: 'prb-verify-head ' + (v.ok ? 'good' : 'warn') },
     v.ok ? '✅ PR content fully present in this site' : '⚠️ Some PR-changed files do not match'));
   const row = (label, n, bad) => el('span', { class: 'prb-vstat' + (bad && n ? ' bad' : '') }, `${label}: ${n}`);
-  box.append(el('div', { class: 'prb-vstats' },
-    row('✓ match', v.match), row('✓ stamped', v.stamped),
+  const rows = [row('✓ match', v.match), row('✓ stamped', v.stamped)];
+  if (v.built) rows.push(row('– compiled', v.built));
+  rows.push(
     row('⚠ mismatch', v.mismatch, true), row('✗ missing', v.missing, true),
-    row('✗ removed-but-found', v.removed, true), row('removed ok', v.removedOk)));
+    row('✗ removed-but-found', v.removed, true), row('removed ok', v.removedOk));
+  box.append(el('div', { class: 'prb-vstats' }, ...rows));
 }
 
 async function prbRefreshActive() {
@@ -1658,27 +1658,21 @@ async function prbLoadHistory() {
   const box = $('#prbHistory');
   try {
     const { builds } = await api('/api/prbuilder/builds');
-    // Remember the most recent build's products for the "Built products" test scope.
-    PRB.lastBuildProducts = (builds[0] && builds[0].products) || [];
-    const info = $('#prbBuiltInfo');
-    if (info) info.textContent = PRB.lastBuildProducts.length
-      ? `· ${PRB.lastBuildProducts.join(', ')}`
-      : '· (no builds yet)';
     if (!builds.length) { box.innerHTML = '<div class="empty">No builds yet.</div>'; return; }
     const tbody = el('tbody');
     for (const b of builds) {
       tbody.append(el('tr', { class: 'clickable', onclick: () => openPrBuildLog(b.id) },
         el('td', {}, fmtTime(b.startedAt || b.createdAt)),
-        el('td', {}, `PR #${b.prNumber}`),
+        el('td', {}, (b.project && b.project.name) || '—'),
+        el('td', {}, `#${b.prNumber}`),
         el('td', {}, stBadge(b.status)),
-        el('td', {}, `${(b.products || []).length} products`),
         el('td', {}, fmtDuration(b.durationMs))));
     }
     box.innerHTML = '';
     box.append(el('table', {},
       el('thead', {}, el('tr', {},
-        el('th', {}, 'When'), el('th', {}, 'PR'), el('th', {}, 'Status'),
-        el('th', {}, 'Scope'), el('th', {}, 'Duration'))),
+        el('th', {}, 'When'), el('th', {}, 'Project'), el('th', {}, 'PR'),
+        el('th', {}, 'Status'), el('th', {}, 'Duration'))),
       tbody));
   } catch (e) {
     box.innerHTML = `<div class="error-banner">${e.message}</div>`;
