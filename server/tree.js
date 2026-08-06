@@ -12,7 +12,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { SUITE_DIR, TESTS_ROOT_REL, SITES } = require('../config');
+const { SUITE_DIR, TESTS_ROOT_REL, SITES, testFilter } = require('../config');
 const testcount = require('./testcount');
 
 const TESTS_ROOT = path.join(SUITE_DIR, TESTS_ROOT_REL);
@@ -89,7 +89,7 @@ async function build({ refresh = false } = {}) {
 
     for (const dir of cfg.testDirs) {
       const abs = path.join(TESTS_ROOT, dir);
-      const node = buildDirNode(abs, `tests/${dir}/`, counts);
+      const node = buildDirNode(abs, testFilter(dir), counts);
       if (node) {
         dirNodes.push(node);
         siteSpecCount += node.specCount;
@@ -102,7 +102,7 @@ async function build({ refresh = false } = {}) {
       name: cfg.name,
       url: cfg.url,
       testDirs: cfg.testDirs,
-      siteFilters: cfg.testDirs.map((d) => `tests/${d}/`),
+      siteFilters: cfg.testDirs.map((d) => testFilter(d)),
       specCount: siteSpecCount,
       testCount: siteTestCount,
       children: dirNodes,

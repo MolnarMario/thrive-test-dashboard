@@ -7,81 +7,123 @@ const os = require('os');
 /**
  * Dashboard configuration.
  *
- * SUITE_DIR points at the Playwright suite root (the folder containing
- * package.json + .playwright/). Override with DASHBOARD_SUITE_DIR if needed.
+ * Everything here is discovered or read from `sites.config.json` (gitignored —
+ * copy sites.config.example.json to get started), so the dashboard adapts to
+ * whatever layout a Playwright suite happens to use. Two are supported without
+ * any configuration:
  *
- * The SITES map mirrors the suite's `.playwright/sites.config.ts` and the
- * SITE_TEST_DIRS map in `scripts/run-parallel.sh`. Keep them in sync — if a
- * site is added there, add it here too.
+ *   <suite>/playwright.config.ts            + <suite>/tests/…
+ *   <suite>/.playwright/playwright.config.ts + <suite>/.playwright/tests/…
+ *
+ * Every value can be overridden with an env var if auto-detection guesses wrong.
  */
 
 /**
- * Locate the Playwright suite. We identify it by `.playwright/sites.config.ts`,
- * which uniquely marks the suite root. Candidates cover the dashboard living
- * inside the repo (next to the suite folder), running as a standalone sibling
- * of the repo, or living inside the suite itself.
+ * Read sites.config.json. Accepts either the flat `{ <key>: {...} }` map or the
+ * richer `{ suiteDir, sites: { … } }` shape that also pins the suite location.
+ */
+function loadSitesConfig() {
+  const sitesConfigPath = path.join(__dirname, 'sites.config.json');
+  if (fs.existsSync(sitesConfigPath)) {
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(sitesConfigPath, 'utf8'));
+    } catch (err) {
+      throw new Error(`Failed to parse sites.config.json: ${err.message}`);
+    }
+    if (parsed && typeof parsed === 'object' && parsed.sites) {
+      return { suiteDir: parsed.suiteDir || null, sites: parsed.sites };
+    }
+    return { suiteDir: null, sites: parsed };
+  }
+  return {
+    suiteDir: null,
+    sites: {
+      'site-a': { name: 'Site A', url: 'https://site-a.local', testDirs: ['site-a'] },
+      'site-b': { name: 'Site B', url: 'https://site-b.local', testDirs: ['site-b'] },
+      main: { name: 'Main (cross-site)', url: 'https://main.local', testDirs: ['cross-site'] },
+    },
+  };
+}
+
+const SITES_CONFIG = loadSitesConfig();
+
+/**
+ * Site key -> { name, url, testDirs }
+ * testDirs are relative to the tests root and are used both for building the
+ * test tree and as Playwright positional filters (e.g. "tests/site-a/"). Use
+ * ["."] when the specs sit directly in the tests root rather than in per-site
+ * subfolders.
+ */
+const SITES = SITES_CONFIG.sites;
+
+/** Layouts we know how to drive, most specific first. */
+const SUITE_LAYOUTS = [
+  { config: '.playwright/playwright.config.ts', tests: '.playwright/tests' },
+  { config: 'playwright.config.ts', tests: 'tests' },
+];
+
+/** Which layout (if any) a directory uses. */
+function detectLayout(dir) {
+  for (const layout of SUITE_LAYOUTS) {
+    if (fs.existsSync(path.join(dir, layout.config))) return layout;
+  }
+  return null;
+}
+
+/**
+ * Locate the Playwright suite: DASHBOARD_SUITE_DIR → sites.config.json
+ * `suiteDir` → a directory next to (or above) the dashboard that looks like a
+ * Playwright suite.
  */
 function resolveSuiteDir() {
   if (process.env.DASHBOARD_SUITE_DIR) return process.env.DASHBOARD_SUITE_DIR;
-  const marker = path.join('.playwright', 'sites.config.ts');
+  if (SITES_CONFIG.suiteDir) return path.resolve(__dirname, SITES_CONFIG.suiteDir);
   const candidates = [
     path.resolve(__dirname, '..', 'automated-tests'),
     path.resolve(__dirname, '..', 'automated-tests', 'automated-tests'),
     path.resolve(__dirname, '..'),
   ];
   for (const c of candidates) {
-    if (fs.existsSync(path.join(c, marker))) return c;
+    if (detectLayout(c)) return c;
   }
   return candidates[0];
 }
 
 const SUITE_DIR = resolveSuiteDir();
+const LAYOUT = detectLayout(SUITE_DIR) || SUITE_LAYOUTS[0];
 
-// Playwright config path, relative to SUITE_DIR (matches the npm scripts).
-const PLAYWRIGHT_CONFIG = '.playwright/playwright.config.ts';
+// Playwright config path, relative to SUITE_DIR.
+const PLAYWRIGHT_CONFIG = process.env.DASHBOARD_PLAYWRIGHT_CONFIG || LAYOUT.config;
 
 // Where the actual spec files live on disk, relative to SUITE_DIR.
-const TESTS_ROOT_REL = '.playwright/tests';
+const TESTS_ROOT_REL = process.env.DASHBOARD_TESTS_ROOT || LAYOUT.tests;
 
 /**
- * Site key -> { name, url, testDirs }
- * testDirs are relative to the tests root and are used both for building the
- * test tree and as Playwright positional filters (e.g. "tests/site-a/").
- *
- * Loaded from sites.config.json in the dashboard root if present (gitignored —
- * that's where your real site list lives; copy sites.config.example.json to
- * get started). Falls back to a small generic example below so the dashboard
- * still runs out of the box.
+ * Playwright matches positional filters as a substring of the full spec path,
+ * so "tests/" is the prefix regardless of whether the tests root is `tests` or
+ * `.playwright/tests`. A dir of "." (or empty) means the whole tests root.
  */
-function loadSites() {
-  const sitesConfigPath = path.join(__dirname, 'sites.config.json');
-  if (fs.existsSync(sitesConfigPath)) {
-    try {
-      return JSON.parse(fs.readFileSync(sitesConfigPath, 'utf8'));
-    } catch (err) {
-      throw new Error(`Failed to parse sites.config.json: ${err.message}`);
-    }
-  }
-  return {
-    'site-a': {
-      name: 'Site A',
-      url: 'https://site-a.local',
-      testDirs: ['site-a'],
-    },
-    'site-b': {
-      name: 'Site B',
-      url: 'https://site-b.local',
-      testDirs: ['site-b'],
-    },
-    main: {
-      name: 'Main (cross-site)',
-      url: 'https://main.local',
-      testDirs: ['cross-site'],
-    },
-  };
+function testFilter(dir) {
+  return !dir || dir === '.' ? 'tests/' : `tests/${dir}/`;
 }
 
-const SITES = loadSites();
+/**
+ * Positional filter for the auth step, or null when the suite has no
+ * `auth.setup.ts` (suites that log in via Playwright's `globalSetup` don't need
+ * one — the orchestrator then skips its auth phase entirely). Set
+ * DASHBOARD_AUTH_SETUP='' to force-skip, or to a path to point it elsewhere.
+ */
+function resolveAuthSetup() {
+  if (process.env.DASHBOARD_AUTH_SETUP !== undefined) {
+    return process.env.DASHBOARD_AUTH_SETUP || null;
+  }
+  return fs.existsSync(path.join(SUITE_DIR, TESTS_ROOT_REL, 'auth.setup.ts'))
+    ? 'tests/auth.setup.ts'
+    : null;
+}
+
+const AUTH_SETUP = resolveAuthSetup();
 
 // Playwright CLI entry point inside the suite (spawned via `node <cli.js>`).
 const PLAYWRIGHT_CLI = path.join(
@@ -161,6 +203,8 @@ module.exports = {
   PLAYWRIGHT_CONFIG,
   PLAYWRIGHT_CLI,
   TESTS_ROOT_REL,
+  AUTH_SETUP,
+  testFilter,
   SITES,
   DATA_DIR,
   RUNS_DIR,

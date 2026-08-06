@@ -66,16 +66,44 @@ Checkouts live under `~/.wp-pr-builder/<project>/` (override with
 
 ## Configuration
 
-- `DASHBOARD_SUITE_DIR` — path to the Playwright suite root (the folder
-  containing `package.json` + `.playwright/`). If unset, the dashboard looks
-  for an `automated-tests` folder next to it, then falls back to its own
-  parent directory.
-- `PORT` — HTTP port (default `4400`).
-- **Sites** — copy [`sites.config.example.json`](./sites.config.example.json)
-  to `sites.config.json` (gitignored) in the dashboard root and edit it to
-  match your suite's `.playwright/sites.config.ts`. Each entry is
-  `key: { name, url, testDirs }`. If `sites.config.json` is missing, a small
-  generic example is used so the dashboard still runs out of the box.
+Copy [`sites.config.example.json`](./sites.config.example.json) to
+`sites.config.json` (gitignored) in the dashboard root:
+
+```json
+{
+  "suiteDir": "../my-plugin/e2e-playwright",
+  "sites": {
+    "my-site": {
+      "name": "My Site",
+      "url": "http://my-site.local",
+      "testDirs": ["."]
+    }
+  }
+}
+```
+
+- `suiteDir` — path to the Playwright suite root, relative to the dashboard.
+  Optional; if omitted the dashboard looks for a suite next to it.
+- `sites` — one entry per test area: `key: { name, url, testDirs }`. `testDirs`
+  are relative to the tests root; use `["."]` when the specs sit directly in
+  the tests root rather than in per-site subfolders.
+
+**Suite layout** is auto-detected — both of these work with no configuration:
+
+```
+<suite>/playwright.config.ts             <suite>/.playwright/playwright.config.ts
+<suite>/tests/…                          <suite>/.playwright/tests/…
+```
+
+**Authentication** — if the suite has `<tests root>/auth.setup.ts`, it runs
+once per site before the tests. If it doesn't (e.g. the suite logs in from
+Playwright's `globalSetup`), that phase is skipped automatically.
+
+Env overrides, if auto-detection guesses wrong:
+
+- `DASHBOARD_SUITE_DIR`, `DASHBOARD_PLAYWRIGHT_CONFIG`, `DASHBOARD_TESTS_ROOT`
+- `DASHBOARD_AUTH_SETUP` — a spec path, or empty to skip the auth phase
+- `PORT` — HTTP port (default `4400`)
 
 ## Data layout
 

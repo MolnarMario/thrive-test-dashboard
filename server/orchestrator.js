@@ -23,6 +23,8 @@ const {
   SITE_START_STAGGER_MS,
   MAX_CONCURRENT_SITES,
   SITE_START_PRIORITY,
+  AUTH_SETUP,
+  testFilter,
 } = require('../config');
 const store = require('./store');
 
@@ -135,7 +137,7 @@ function startRun(targets, label) {
       const paths =
         Array.isArray(t.paths) && t.paths.length
           ? t.paths
-          : (cfg ? cfg.testDirs.map((d) => `tests/${d}/`) : ['tests/']);
+          : (cfg ? cfg.testDirs.map((d) => testFilter(d)) : ['tests/']);
       spawnEnvs.set(`${id}:${t.site}`, custom
         ? { PLAYWRIGHT_BASE_URL: t.baseUrl, ...(t.env || {}) }
         : { TEST_SITE: t.site });
@@ -189,22 +191,29 @@ async function executeRun(id) {
   emit(id, { kind: 'run-start', run: snapshot(id) });
 
   // Phase 1: authenticate each target sequentially (fast, ~5s each), in
-  // priority order (apprentice, architect, ttb, quiz first).
-  for (const target of orderTargets(run.targets)) {
-    if (run.cancelled) break;
-    if (target.cancelled) continue; // cancelled while queued
-    target.status = 'authenticating';
-    emit(id, { kind: 'target-update', target: slimTarget(target) });
-
-    const ok = await authenticate(id, target);
-    if (run.cancelled || target.cancelled) continue; // don't clobber a cancel
-    target.authStatus = ok ? 'ok' : 'failed';
-    if (!ok) {
-      target.status = 'error';
-      releaseSite(target.site, id); // free the site the moment auth fails
-      emit(id, { kind: 'target-update', target: slimTarget(target) });
-    }
+  // SITE_START_PRIORITY order. Suites that log in from Playwright's
+  // `globalSetup` have no auth.setup.ts to run, so this phase is skipped and
+  // every target goes straight to the test phase.
+  if (!AUTH_SETUP) {
+    for (const target of run.targets) target.authStatus = 'ok';
     store.saveRun(run);
+  } else {
+    for (const target of orderTargets(run.targets)) {
+      if (run.cancelled) break;
+      if (target.cancelled) continue; // cancelled while queued
+      target.status = 'authenticating';
+      emit(id, { kind: 'target-update', target: slimTarget(target) });
+
+      const ok = await authenticate(id, target);
+      if (run.cancelled || target.cancelled) continue; // don't clobber a cancel
+      target.authStatus = ok ? 'ok' : 'failed';
+      if (!ok) {
+        target.status = 'error';
+        releaseSite(target.site, id); // free the site the moment auth fails
+        emit(id, { kind: 'target-update', target: slimTarget(target) });
+      }
+      store.saveRun(run);
+    }
   }
 
   // Phase 2: launch tests for every authenticated target, in priority order,
@@ -277,7 +286,7 @@ function cancellableDelay(id, ms) {
 async function authenticate(id, target, attempt = 1) {
   const ok = await new Promise((resolve) => {
     const child = spawnPw({
-      args: ['--reporter=line', 'tests/auth.setup.ts'],
+      args: ['--reporter=line', AUTH_SETUP],
       spawnEnv: spawnEnvs.get(`${id}:${target.site}`),
       logFile: target.authLog,
     });

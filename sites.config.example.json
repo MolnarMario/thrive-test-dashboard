@@ -1,17 +1,21 @@
 {
-  "site-a": {
-    "name": "Site A",
-    "url": "https://site-a.local",
-    "testDirs": ["site-a"]
-  },
-  "site-b": {
-    "name": "Site B",
-    "url": "https://site-b.local",
-    "testDirs": ["site-b"]
-  },
-  "main": {
-    "name": "Main (cross-site)",
-    "url": "https://main.local",
-    "testDirs": ["cross-site"]
+  "_comment": "Copy to sites.config.json and edit. `suiteDir` is optional and resolved relative to the dashboard root; omit it to auto-detect a Playwright suite next to the dashboard. Use testDirs: [\".\"] when specs sit directly in the tests root rather than in per-site subfolders.",
+  "suiteDir": "../automated-tests",
+  "sites": {
+    "site-a": {
+      "name": "Site A",
+      "url": "https://site-a.local",
+      "testDirs": ["site-a"]
+    },
+    "site-b": {
+      "name": "Site B",
+      "url": "https://site-b.local",
+      "testDirs": ["site-b"]
+    },
+    "main": {
+      "name": "Main (cross-site)",
+      "url": "https://main.local",
+      "testDirs": ["cross-site"]
+    }
   }
 }
