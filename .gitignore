@@ -2,3 +2,5 @@ node_modules/
 data/
 reporter-smoke/
 *.log
+sites.config.json
+pr-builder.config.json

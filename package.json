@@ -1,8 +1,8 @@
 {
-  "name": "thrive-test-dashboard",
+  "name": "automation-test-platform",
   "version": "0.1.0",
   "private": true,
-  "description": "Local web dashboard to run, watch, and review the Thrive Themes Playwright suites.",
+  "description": "Local web dashboard to run, watch, and review Playwright test suites.",
   "type": "commonjs",
   "scripts": {
     "start": "node server/index.js",

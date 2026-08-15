@@ -1,7 +1,7 @@
-# Changelog — Thrive Test Dashboard
+# Changelog — Automation Test Platform
 
-All notable changes to the dashboard (the local web UI that runs the Thrive
-Playwright suites across per-product LocalWP sites).
+All notable changes to the dashboard (the local web UI that runs Playwright
+suites across configured sites).
 
 ## 2026-07-08 — Run pacing, per-site control, and a combined report
 
@@ -11,12 +11,12 @@ a reporting gap. This release addresses all four.
 ### 1. Staggered launch (fixes out-of-memory crashes)
 
 **Why:** the orchestrator launched every authenticated site's Playwright process
-**simultaneously** (`Promise.all(runnable.map(runTests))`). Eleven WordPress/Thrive
-stacks plus a swarm of headless Chromium instances exhausted machine memory, so the
-OS refused new allocations and several sites died mid-startup with PHP
-`Fatal error: Out of memory` / nginx `502 Bad Gateway` (observed on TA, TTB, TQB,
-TO). Which sites lost was down to luck under contention, so the failures looked
-random.
+**simultaneously** (`Promise.all(runnable.map(runTests))`). Eleven concurrent
+WordPress stacks plus a swarm of headless Chromium instances exhausted machine
+memory, so the OS refused new allocations and several sites died mid-startup
+with PHP `Fatal error: Out of memory` / nginx `502 Bad Gateway` (observed on
+several sites). Which sites lost was down to luck under contention, so the
+failures looked random.
 
 **What changed** (`config.js`, `server/orchestrator.js`):
 - Sites now launch **one at a time with a delay between starts** —
@@ -93,11 +93,10 @@ export.
 - `public/style.css` — `.card-actions`, small button + run-head link styling
 
 ### Local configuration note (not a code change to review)
-On the machine this runs on, the LocalWP sites are named
-`for-automation-testing-*.local`, while the committed suite config
-(`thrive-themes-automated-tests/.playwright/sites.config.ts`) hardcodes the
-canonical `thrive-tests-*.local` names. To run against the real local sites, the
-suite's `sites.config.ts` URLs were pointed at the `for-automation-testing-*`
-domains **locally**. This is a machine-specific override, intentionally kept out
-of this dashboard change; the long-term fix is to rename the Local sites to the
-canonical `thrive-tests-*` names and drop the override.
+On the machine this runs on, the local site domains didn't match the
+canonical names hardcoded in the committed suite config
+(`.playwright/sites.config.ts`). To run against the real local sites, the
+suite's `sites.config.ts` URLs were pointed at the actual local domains. This
+is a machine-specific override, intentionally kept out of this dashboard
+change; the long-term fix is to rename the local sites to the canonical names
+and drop the override.

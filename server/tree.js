@@ -1,133 +1,331 @@
 'use strict';
 
 /**
- * Builds the selectable test tree from the suite on disk.
+ * Builds the selectable test tree, one branch per configured suite.
  *
- * For each configured site we walk its testDirs under .playwright/tests and
- * produce a nested folder/file tree. Every node carries a `filter` string
- * (e.g. "tests/thrive-architect/Pages/") that can be passed directly to
- * Playwright as a positional argument — Playwright matches it as a substring
- * of the full spec path, which is exactly how run-parallel.sh targets dirs.
+ * Each suite is asked (via its framework adapter) to enumerate its specs and the
+ * tests inside them; the flat list is then folded into a folder/file tree. Every
+ * node carries a `filter` — a path relative to that suite's tests root — which
+ * is what a run target sends back as its `paths`, and which each adapter turns
+ * into whatever its CLI actually wants (a Playwright positional filter, a
+ * Cypress `--spec` glob, a Surefire `-Dtest=` class list).
+ *
+ * A suite may also declare `scopes`: named slices of itself that are selected
+ * and targeted independently, each with its own site. A suite without scopes has
+ * exactly one implicit scope covering everything.
  */
 
-const fs = require('fs');
 const path = require('path');
-const { SUITE_DIR, TESTS_ROOT_REL, SITES } = require('../config');
-const testcount = require('./testcount');
 
-const TESTS_ROOT = path.join(SUITE_DIR, TESTS_ROOT_REL);
-const SPEC_RE = /\.spec\.[tj]s$/;
+const { SUITES, SITES } = require('../config');
+const frameworks = require('./frameworks');
 
 let cache = null;
 let inflight = null;
 
 /**
- * Recursively build a node for a directory. Returns null if it contains no
- * specs. Each node carries both specCount (files) and testCount (actual tests
- * that will run, from Playwright's collection — see testcount.js).
+ * Fold `[{ file: 'a/b.cy.ts', tests: [...] }]` into a nested tree, keeping only
+ * the part of the listing under `prefix` (a scope's directory, '' for all).
+ *
+ * For a composite suite (see buildCompositeSuite), entries also carry a
+ * `framework` id. `frameworkFilter`, when given, keeps only that framework's
+ * entries — buildCompositeSuite calls this once per member framework against
+ * the suite's combined file list. Each node's `filter` — the string a run
+ * request sends back to pick it — gets that framework id prefixed
+ * (`"playwright::tests/login.spec.ts"`) so the orchestrator can tell which
+ * adapter a selected path belongs to; `name` stays the plain file/dir name,
+ * so nothing about how the tree *looks* changes. Every node whose spec files
+ * all belong to one framework also gets a plain `framework` field, which is
+ * what lets the UI show a badge on it once expanded — down to a single spec
+ * file if that's as far as you go. Suites with only one framework never set
+ * `entry.framework`, so `filter`/`name` are identical to before and no node
+ * gets a `framework` field — this is a no-op for every suite that isn't a
+ * combination of frameworks.
  */
-function buildDirNode(absDir, filterPrefix, counts) {
-  let entries;
-  try {
-    entries = fs.readdirSync(absDir, { withFileTypes: true });
-  } catch (_) {
-    return null;
-  }
+function buildNodes(files, prefix, frameworkFilter) {
+  const root = { children: new Map(), specCount: 0, testCount: 0 };
 
-  const children = [];
-  let specCount = 0;
-  let testCount = 0;
+  for (const entry of files) {
+    if (frameworkFilter && entry.framework !== frameworkFilter) continue;
+    const rel = entry.file.replace(/\\/g, '/');
+    if (prefix && !rel.startsWith(prefix)) continue;
 
-  // Sort: directories first, then files, alphabetically.
-  entries.sort((a, b) => {
-    if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
-    return a.name < b.name ? -1 : 1;
-  });
-
-  for (const e of entries) {
-    if (e.name === 'helpers' || e.name === 'node_modules') continue;
-    const abs = path.join(absDir, e.name);
-    if (e.isDirectory()) {
-      const child = buildDirNode(abs, filterPrefix + e.name + '/', counts);
-      if (child) {
-        children.push(child);
-        specCount += child.specCount;
-        testCount += child.testCount;
+    const wireBase = entry.framework ? `${entry.framework}::` : '';
+    const parts = rel.split('/');
+    let node = root;
+    for (let i = 0; i < parts.length; i++) {
+      const isFile = i === parts.length - 1;
+      const name = parts[i];
+      const realFilter = parts.slice(0, i + 1).join('/') + (isFile ? '' : '/');
+      const filter = wireBase + realFilter;
+      if (!node.children.has(name)) {
+        node.children.set(name, {
+          type: isFile ? 'file' : 'dir',
+          name,
+          filter,
+          specCount: 0,
+          testCount: 0,
+          children: new Map(),
+          frameworks: new Set(),
+        });
       }
-    } else if (SPEC_RE.test(e.name)) {
-      const filter = filterPrefix + e.name;
-      const t = counts[filter] || 0;
-      children.push({ type: 'file', name: e.name, filter, specCount: 1, testCount: t });
-      specCount += 1;
-      testCount += t;
+      const child = node.children.get(name);
+      child.specCount += isFile ? 1 : 0;
+      child.testCount += entry.tests.length;
+      if (entry.framework) child.frameworks.add(entry.framework);
+      if (isFile) {
+        child.specCount = 1;
+        child.testCount = entry.tests.length;
+        if (entry.framework) child.framework = entry.framework;
+      }
+      node = child;
     }
+    root.specCount += 1;
+    root.testCount += entry.tests.length;
   }
 
-  if (specCount === 0) return null;
+  const toArray = (node) =>
+    [...node.children.values()]
+      .sort((a, b) => {
+        if ((a.type === 'dir') !== (b.type === 'dir')) return a.type === 'dir' ? -1 : 1;
+        return a.name < b.name ? -1 : 1;
+      })
+      .map((child) => {
+        // A dir whose descendants are all one framework wears that framework
+        // too — a file always knows its own.
+        const framework = child.type === 'file'
+          ? child.framework
+          : (child.frameworks.size === 1 ? [...child.frameworks][0] : null);
+        return {
+          type: child.type,
+          name: child.name,
+          filter: child.filter,
+          specCount: child.specCount,
+          testCount: child.testCount,
+          ...(framework ? { framework } : {}),
+          ...(child.type === 'dir' ? { children: toArray(child) } : {}),
+        };
+      });
+
+  // Collapse single-child directory chains ("cypress/e2e" style nesting adds a
+  // level of clicking for nothing).
+  const collapse = (nodes) =>
+    nodes.map((n) => {
+      if (n.type !== 'dir') return n;
+      let node = { ...n, children: collapse(n.children) };
+      while (node.children.length === 1 && node.children[0].type === 'dir') {
+        const only = node.children[0];
+        node = { ...only, name: `${node.name}/${only.name}` };
+      }
+      return node;
+    });
 
   return {
-    type: 'dir',
-    name: path.basename(absDir),
-    filter: filterPrefix,
-    specCount,
-    testCount,
-    children,
+    children: collapse(toArray(root)),
+    specCount: root.specCount,
+    testCount: root.testCount,
   };
 }
 
-async function build({ refresh = false } = {}) {
-  const { counts, total, ok } = await testcount.getCounts({ refresh });
+function siteInfo(key) {
+  const s = SITES[key];
+  return s ? { key, name: s.name, url: s.url } : null;
+}
 
-  const sites = [];
-  let grandSpecs = 0;
-  let grandTests = 0;
+async function buildSuite(suite) {
+  const base = {
+    key: suite.key,
+    name: suite.name,
+    framework: suite.framework,
+    dir: suite.dir,
+    sites: suite.sites.map(siteInfo).filter(Boolean),
+    defaultSite: suite.defaultSite,
+  };
 
-  for (const [key, cfg] of Object.entries(SITES)) {
-    const dirNodes = [];
-    let siteSpecCount = 0;
-    let siteTestCount = 0;
+  if (suite.frameworks) return buildCompositeSuite(suite, base);
 
-    for (const dir of cfg.testDirs) {
-      const abs = path.join(TESTS_ROOT, dir);
-      const node = buildDirNode(abs, `tests/${dir}/`, counts);
-      if (node) {
-        dirNodes.push(node);
-        siteSpecCount += node.specCount;
-        siteTestCount += node.testCount;
-      }
-    }
-
-    sites.push({
-      key,
-      name: cfg.name,
-      url: cfg.url,
-      testDirs: cfg.testDirs,
-      siteFilters: cfg.testDirs.map((d) => `tests/${d}/`),
-      specCount: siteSpecCount,
-      testCount: siteTestCount,
-      children: dirNodes,
-    });
-    grandSpecs += siteSpecCount;
-    grandTests += siteTestCount;
+  if (!suite.framework || !frameworks.has(suite.framework)) {
+    return { ...base, ok: false, error: suite.reason, scopes: [], specCount: 0, testCount: 0 };
   }
 
+  const meta = frameworks.describe(suite.framework);
+  const adapter = frameworks.get(suite.framework);
+  const tooling = adapter.checkTooling(suite.dir, suite.layout);
+
+  if (!suite.ok) {
+    return { ...base, ...meta, ok: false, error: suite.reason, tooling, scopes: [], specCount: 0, testCount: 0 };
+  }
+
+  let listing = { files: [], exact: false };
+  let error = null;
+  try {
+    listing = await adapter.discover(suite.dir, suite.layout);
+  } catch (err) {
+    error = String((err && err.message) || err);
+  }
+
+  // No declared scopes → one implicit scope covering the whole suite.
+  const scopeDefs = suite.scopes.length
+    ? suite.scopes
+    : [{ key: '', name: 'All tests', dirs: ['.'], defaultSite: null }];
+
+  const scopes = scopeDefs.map((scope) => {
+    const dirs = scope.dirs.length ? scope.dirs : ['.'];
+    const merged = { children: [], specCount: 0, testCount: 0 };
+    for (const dir of dirs) {
+      const prefix = !dir || dir === '.' ? '' : dir.replace(/\\/g, '/').replace(/\/?$/, '/');
+      const built = buildNodes(listing.files, prefix);
+      merged.children.push(...built.children);
+      merged.specCount += built.specCount;
+      merged.testCount += built.testCount;
+    }
+    return {
+      key: scope.key,
+      name: scope.name,
+      // What a run target sends when the whole scope is selected.
+      filters: dirs.map((d) => (!d || d === '.' ? '' : d.replace(/\\/g, '/').replace(/\/?$/, '/'))),
+      defaultSite:
+        (scope.defaultSite && suite.sites.includes(scope.defaultSite) && scope.defaultSite) ||
+        suite.defaultSite,
+      specCount: merged.specCount,
+      testCount: merged.testCount,
+      children: merged.children,
+    };
+  });
+
   return {
-    sites,
-    totalSpecs: grandSpecs,
-    totalTests: grandTests,
-    // false if `--list` failed → UI falls back to showing spec counts only.
-    testCountsOk: ok && total > 0,
-    testsRoot: TESTS_ROOT,
+    ...base,
+    ...meta,
+    ok: true,
+    error,
+    tooling,
+    testsRoot: path.join(suite.dir, suite.layout.testsRoot),
+    // Playwright collects its own tests, so its counts are exact; the others are
+    // parsed from source and the UI says so.
+    exactCounts: listing.exact,
+    scopes,
+    specCount: scopes.reduce((n, s) => n + s.specCount, 0),
+    testCount: scopes.reduce((n, s) => n + s.testCount, 0),
+  };
+}
+
+/**
+ * A suite that holds more than one framework (see config.js's
+ * normaliseCompositeSuite). Every member is discovered independently through
+ * its own adapter, tagged with its framework id, then folded into one tree —
+ * so the suite shows up as a single branch in the UI whose spec files each
+ * carry which framework/language they are, all the way down to a leaf.
+ */
+async function buildCompositeSuite(suite, base) {
+  const members = [];
+  for (const fw of suite.frameworks) {
+    if (!frameworks.has(fw.id) || !fw.layout.ok) {
+      members.push({ id: fw.id, meta: null, layoutOk: false, tooling: null, error: fw.layout.reason, files: [], exact: true });
+      continue;
+    }
+    const meta = frameworks.describe(fw.id);
+    const adapter = frameworks.get(fw.id);
+    const tooling = adapter.checkTooling(suite.dir, fw.layout);
+    let files = [];
+    let exact = true;
+    let error = null;
+    try {
+      const listing = await adapter.discover(suite.dir, fw.layout);
+      files = listing.files.map((f) => ({ ...f, framework: fw.id }));
+      exact = listing.exact;
+    } catch (err) {
+      error = String((err && err.message) || err);
+    }
+    members.push({ id: fw.id, meta, layoutOk: true, tooling, error, files, exact });
+  }
+
+  const allFiles = members.flatMap((m) => m.files);
+  // A member is browsable/selectable as soon as its config file is found —
+  // exactly like a plain suite, which stays browsable even before `npm
+  // install`. Whether it can actually *run* right now (tooling) is a
+  // separate, non-gating concern surfaced per-member below.
+  const browsableIds = new Set(members.filter((m) => m.layoutOk).map((m) => m.id));
+
+  const scopeDefs = suite.scopes.length
+    ? suite.scopes
+    : [{ key: '', name: 'All tests', dirs: ['.'], defaultSite: null }];
+
+  const scopes = scopeDefs.map((scope) => {
+    const dirs = scope.dirs.length ? scope.dirs : ['.'];
+    const merged = { children: [], specCount: 0, testCount: 0 };
+    const filters = [];
+    for (const dir of dirs) {
+      const rel = !dir || dir === '.' ? '' : dir.replace(/\\/g, '/').replace(/\/?$/, '/');
+      for (const m of members) {
+        if (!browsableIds.has(m.id)) continue;
+        filters.push(`${m.id}::${rel}`);
+        const built = buildNodes(allFiles, rel, m.id);
+        merged.children.push(...built.children);
+        merged.specCount += built.specCount;
+        merged.testCount += built.testCount;
+      }
+    }
+    return {
+      key: scope.key,
+      name: scope.name,
+      filters,
+      defaultSite:
+        (scope.defaultSite && suite.sites.includes(scope.defaultSite) && scope.defaultSite) ||
+        suite.defaultSite,
+      specCount: merged.specCount,
+      testCount: merged.testCount,
+      children: merged.children,
+    };
+  });
+
+  return {
+    ...base,
+    framework: null,
+    composite: true,
+    frameworks: members.map((m) => {
+      const ok = m.layoutOk && !m.error && (!m.tooling || m.tooling.ok);
+      return {
+        id: m.id,
+        label: (m.meta && m.meta.label) || m.id,
+        language: m.meta && m.meta.language,
+        runner: m.meta && m.meta.runner,
+        specLabel: m.meta && m.meta.specLabel,
+        supportsGrep: m.meta ? m.meta.supportsGrep : false,
+        grepNote: m.meta ? m.meta.grepNote : null,
+        reportKind: m.meta && m.meta.reportKind,
+        ok,
+        error: ok ? null : (m.error || (m.tooling && m.tooling.message) || null),
+      };
+    }),
+    ok: suite.ok,
+    error: suite.ok ? null : suite.reason,
+    tooling: null,
+    testsRoot: null,
+    exactCounts: members.every((m) => m.exact !== false),
+    scopes,
+    specCount: scopes.reduce((n, s) => n + s.specCount, 0),
+    testCount: scopes.reduce((n, s) => n + s.testCount, 0),
+  };
+}
+
+async function build() {
+  const suites = await Promise.all(Object.values(SUITES).map(buildSuite));
+  return {
+    suites,
+    sites: Object.values(SITES).map((s) => ({ key: s.key, name: s.name, url: s.url })),
+    totalSpecs: suites.reduce((n, s) => n + (s.specCount || 0), 0),
+    totalTests: suites.reduce((n, s) => n + (s.testCount || 0), 0),
+    testCountsOk: suites.some((s) => s.testCount > 0),
   };
 }
 
 async function getTree({ refresh = false } = {}) {
   if (cache && !refresh) return cache;
   if (inflight && !refresh) return inflight; // share one build across concurrent cold calls
-  inflight = build({ refresh })
+  inflight = build()
     .then((built) => { cache = built; inflight = null; return built; })
     .catch((err) => { inflight = null; throw err; });
   return inflight;
 }
 
-module.exports = { getTree };
+module.exports = { getTree, _buildNodes: buildNodes };

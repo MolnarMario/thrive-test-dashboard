@@ -3,18 +3,21 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Thrive Test Automator</title>
+    <title>Automation Test Platform</title>
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark">
-          <img src="thrive-automation-logo.png" alt="Thrive Test Automator" />
+          <svg viewBox="0 0 60 60" role="img" aria-label="Automation Test Platform">
+            <circle cx="30" cy="30" r="28" fill="var(--accent)" />
+            <path d="M18 31l8 8 16-17" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
         </span>
         <span class="brand-text">
-          <span class="brand-title">Thrive Test Automator</span>
-          <span class="brand-sub">runner · history · PR builder</span>
+          <span class="brand-title">Automation Test Platform</span>
+          <span class="brand-sub">Playwright · Cypress · Selenium</span>
         </span>
       </div>
       <nav class="tabs">
@@ -38,13 +41,16 @@
             <button id="btnClear" class="ghost">Clear selection</button>
             <button id="btnRefreshTree" class="ghost" title="Rescan suite for specs">↻ Rescan</button>
             <button id="btnCheckSites" class="ghost" title="Ping LocalWP sites">◎ Check sites</button>
+            <button id="btnAddSite" class="ghost">+ Add site</button>
           </div>
           <div class="right">
-            <input id="grepInput" type="text" placeholder="Filter by keyword (--grep), optional" />
+            <input id="grepInput" type="text" placeholder="Filter by keyword, optional" />
             <span id="selCount" class="sel-count">0 specs selected</span>
             <button id="btnRun" class="primary" disabled>Run selected ▶</button>
           </div>
         </div>
+        <div id="siteForm" class="sched-form hidden"></div>
+        <div id="grepHint" class="warn-banner hidden"></div>
         <div id="runError" class="error-banner hidden"></div>
         <div id="tree" class="tree">Loading test tree…</div>
       </section>
@@ -70,6 +76,7 @@
             <option value="running">Running</option>
           </select>
           <select id="hSite"><option value="">All sites</option></select>
+          <select id="hFramework"><option value="">All frameworks</option></select>
           <span id="hCount" class="sel-count"></span>
         </div>
         <div id="historyList" class="history-list">Loading…</div>
@@ -112,28 +119,20 @@
             <h3>Build a PR onto <code id="prbSite">…</code></h3>
             <div id="prbError" class="error-banner hidden"></div>
 
-            <label>Milestone <span class="muted">(optional — filters PRs)</span></label>
-            <select id="prbMilestone"><option value="">— Recent open PRs —</option></select>
+            <label>Project</label>
+            <select id="prbProject"></select>
+            <div id="prbProjectInfo" class="prb-scope-info"></div>
 
-            <label>PR</label>
+            <label>Open PRs <span class="muted">(optional — fills the field below)</span></label>
             <select id="prbPr"><option value="">— pick a PR —</option></select>
 
-            <label>PR Number</label>
-            <input id="prbPrNumber" type="text" inputmode="numeric" placeholder="e.g. 3752" />
+            <label>PR number or link</label>
+            <input id="prbPrNumber" type="text" placeholder="3752 — or paste the PR URL" />
 
             <label>Version <span class="muted">(optional)</span></label>
             <input id="prbVersion" type="text" placeholder="100.PR<N>" />
 
-            <label>Build scope</label>
-            <select id="prbScope">
-              <option value="smart">Smart pick — only what this PR touches</option>
-              <option value="all">All 12 products (full suite)</option>
-            </select>
-            <div id="prbScopeInfo" class="prb-scope-info"></div>
-
-            <label class="prb-check"><input type="checkbox" id="prbClean" /> Clean WP plugins folder first</label>
-            <label class="prb-check sub"><input type="checkbox" id="prbKeepTpm" checked /> keep Thrive Product Manager</label>
-            <label class="prb-check"><input type="checkbox" id="prbForce" checked /> Force clean build (wipe release cache)</label>
+            <label class="prb-check"><input type="checkbox" id="prbClean" checked /> Clean install (remove the existing folder first)</label>
 
             <div class="prb-actions">
               <button id="prbBuild" class="primary">Build &amp; Install ▶</button>
@@ -156,16 +155,18 @@
 
         <div class="prb-runtests">
           <h3>Run tests on <code id="prbTestSite">…</code></h3>
-          <p class="muted-note">Runs the suite against the PR-built site (single-site mode). The site must be running in Local. Results appear in <b>Live</b> and <b>History</b>.</p>
+          <p class="muted-note">Runs a suite against the PR-built site. The site must be running in Local. Results appear in <b>Live</b> and <b>History</b>.</p>
           <div id="prbTestError" class="error-banner hidden"></div>
+          <label>Suite</label>
+          <select id="prbSuite"></select>
           <div class="prb-test-scope">
-            <label class="prb-radio"><input type="radio" name="prbTestScope" value="built" checked /> Built products' tests <span id="prbBuiltInfo" class="muted"></span></label>
-            <label class="prb-radio"><input type="radio" name="prbTestScope" value="areas" /> Specific products…</label>
+            <label class="prb-radio"><input type="radio" name="prbTestScope" value="project" checked /> Project's tests <span id="prbBuiltInfo" class="muted"></span></label>
+            <label class="prb-radio"><input type="radio" name="prbTestScope" value="areas" /> Specific areas…</label>
             <label class="prb-radio"><input type="radio" name="prbTestScope" value="all" /> All tests</label>
           </div>
           <div id="prbAreas" class="prb-areas hidden"></div>
           <div class="prb-test-row">
-            <input id="prbTestGrep" type="text" placeholder="Keyword filter (--grep), e.g. 1997 — optional" />
+            <input id="prbTestGrep" type="text" placeholder="Keyword filter (--grep) — optional" />
             <button id="prbRunTests" class="primary">Run tests ▶</button>
           </div>
         </div>

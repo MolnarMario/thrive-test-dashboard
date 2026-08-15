@@ -1,12 +1,16 @@
 'use strict';
 
 /**
- * Run orchestrator. Spawns Playwright per target site (auth, then tests),
- * tails each site's NDJSON event file for live progress, emits 'update'
- * events for SSE, and persists results via the store.
+ * Run orchestrator.
  *
- * Mirrors scripts/run-parallel.sh: sequential auth, then parallel test runs,
- * one OS process per target site.
+ * A run is a set of targets, where a target is one (suite, site) pair: *which*
+ * tests, run *where*. The orchestrator is deliberately framework-blind — it
+ * asks the suite's adapter for a command to spawn, tails a single NDJSON event
+ * format for live progress, and persists results via the store. Everything that
+ * differs between Playwright, Cypress and Selenium lives in server/frameworks/.
+ *
+ * Targets run one OS process each: auth first (only frameworks that need a
+ * separate auth step), then tests, staggered to avoid memory contention.
  */
 
 const fs = require('fs');
@@ -15,15 +19,17 @@ const { spawn, spawnSync } = require('child_process');
 const { EventEmitter } = require('events');
 
 const {
-  SUITE_DIR,
-  PLAYWRIGHT_CONFIG,
-  PLAYWRIGHT_CLI,
-  REPORTER_PATH,
   SITES,
+  SUITES,
+  DEFAULT_SUITE,
+  siteEnv,
+  targetKey,
+  REPORTER_PATHS,
   SITE_START_STAGGER_MS,
   MAX_CONCURRENT_SITES,
   SITE_START_PRIORITY,
 } = require('../config');
+const frameworks = require('./frameworks');
 const store = require('./store');
 
 const events = new EventEmitter();
@@ -32,13 +38,15 @@ const events = new EventEmitter();
 const active = new Map();
 /** runId -> [ChildProcess] for cancellation */
 const procs = new Map();
-/** site key -> runId that currently owns it (concurrency guard + ownership) */
-const busySites = new Map();
-/** `${runId}:${site}` -> planned test list (live-only; not persisted) */
+/** target key -> runId that currently owns it (concurrency guard + ownership) */
+const busyTargets = new Map();
+/** `${runId}:${targetKey}` -> planned test list (live-only; not persisted) */
 const plans = new Map();
-/** `${runId}:${site}` -> child env overrides (THRIVE_SITE, or single-site
- *  PLAYWRIGHT_BASE_URL + creds). Kept off the run record so creds aren't persisted. */
+/** `${runId}:${targetKey}` -> child env overrides. Kept off the run record so
+ *  credentials are never persisted. */
 const spawnEnvs = new Map();
+/** `${runId}:${targetKey}` -> adapter run spec (command/args/extras). */
+const runSpecs = new Map();
 
 function makeRunId() {
   const d = new Date();
@@ -65,12 +73,12 @@ function isTerminal(status) {
 }
 
 /**
- * Free a site ONLY if this run still owns it. Prevents an old run's finalize
- * from releasing a site that a newer run has already re-acquired (e.g. after a
- * per-site cancel frees the site early and the user starts a fresh run for it).
+ * Free a target ONLY if this run still owns it. Prevents an old run's finalize
+ * from releasing a target that a newer run has already re-acquired (e.g. after a
+ * per-target cancel frees it early and the user starts a fresh run for it).
  */
-function releaseSite(site, runId) {
-  if (busySites.get(site) === runId) busySites.delete(site);
+function releaseTarget(key, runId) {
+  if (busyTargets.get(key) === runId) busyTargets.delete(key);
 }
 
 /**
@@ -89,9 +97,145 @@ function orderTargets(targets) {
     .map((x) => x.t);
 }
 
+/* --------------------------------- starting -------------------------------- */
+
+/**
+ * Resolve one requested target into the record(s) the run stores and executes.
+ *
+ * Almost always one record. The exception is a composite suite (one directory
+ * holding more than one framework — see config.js's normaliseCompositeSuite):
+ * there, one requested (suite, site) fans out into one record per member
+ * framework the selection actually touches, each spawning its own process
+ * against the same site. That's what makes "run the whole suite" run every
+ * framework in it fully, not just whichever one the config happened to name.
+ */
+function resolveTarget(t, runDir) {
+  const suiteKey = t.suite || DEFAULT_SUITE;
+  const suite = SUITES[suiteKey];
+  if (!suite) throw new Error(`Unknown suite: ${t.suite}`);
+  if (!suite.ok) throw new Error(`Suite "${suite.name}" is not runnable: ${suite.reason}`);
+
+  if (suite.frameworks) return resolveCompositeTargets(suite, t, runDir);
+  return [resolveSingleTarget(suite, t, runDir)];
+}
+
+/**
+ * Split a composite suite's requested paths by the framework id each is
+ * prefixed with (`"playwright::tests/login.spec.ts"` — see tree.js's
+ * buildNodes), and build one target per framework touched. Paths that carry
+ * no recognised prefix (no selection was made, or an older/other caller sent
+ * a plain path — e.g. the PR Builder's `['']` "everything") fall back to
+ * every runnable member framework, run in full — the safe default for
+ * "nothing more specific was said."
+ */
+function resolveCompositeTargets(suite, t, runDir) {
+  const runnable = suite.frameworks.filter((f) => f.layout && f.layout.ok);
+  if (!runnable.length) throw new Error(`Suite "${suite.name}" has no runnable framework.`);
+
+  const byFramework = new Map();
+  for (const raw of Array.isArray(t.paths) ? t.paths : []) {
+    const s = String(raw || '');
+    const idx = s.indexOf('::');
+    if (idx === -1) continue; // unprefixed — doesn't identify a framework
+    const id = s.slice(0, idx);
+    const rel = s.slice(idx + 2);
+    if (!runnable.some((f) => f.id === id)) continue; // unknown/broken member
+    if (!byFramework.has(id)) byFramework.set(id, []);
+    if (rel) byFramework.get(id).push(rel);
+  }
+  const wanted = byFramework.size ? byFramework : new Map(runnable.map((f) => [f.id, []]));
+
+  const out = [];
+  for (const [id, rel] of wanted) {
+    out.push(resolveSingleTarget(
+      suite,
+      { ...t, paths: rel.length ? rel : undefined },
+      runDir,
+      { framework: id }
+    ));
+  }
+  if (!out.length) throw new Error(`No runnable framework matched the selection for "${suite.name}".`);
+  return out;
+}
+
+/**
+ * Two flavours: a normal (suite, registered site) pair, and a "custom" target
+ * that carries its own baseUrl — used by the PR Builder to test a site that
+ * isn't in the config. `member` overrides `{framework, layout}` for one leg of
+ * a composite suite; omitted for a plain single-framework suite, which reads
+ * both off the suite itself exactly as before.
+ */
+function resolveSingleTarget(suite, t, runDir, member) {
+  const suiteKey = t.suite || DEFAULT_SUITE;
+  const framework = member ? member.framework : suite.framework;
+
+  const custom = !!t.baseUrl && !SITES[t.site];
+  const site = SITES[t.site];
+  if (!custom && !site) throw new Error(`Unknown site: ${t.site}`);
+
+  const adapter = frameworks.get(framework);
+  const key = targetKey(suiteKey, t.site, member ? framework : null);
+
+  const scope = (suite.scopes || []).find((s) => s.key === t.scope) || null;
+  const defaultPaths = scope
+    ? scope.dirs.map((d) => (!d || d === '.' ? '' : d.replace(/\\/g, '/').replace(/\/?$/, '/')))
+    : [''];
+  const paths = Array.isArray(t.paths) && t.paths.length ? t.paths : defaultPaths;
+
+  const baseUrl = custom ? t.baseUrl.replace(/\/$/, '') : site.url;
+  const grepIgnored = !!t.grep && !adapter.supportsGrep;
+
+  // A custom target isn't in the sites config, so its credentials come from the
+  // caller (the PR Builder) rather than from a registered site.
+  const adminUser = custom ? (t.env || {}).E2E_ADMIN_USER || 'admin' : site.adminUser;
+  const adminPass = custom ? (t.env || {}).E2E_ADMIN_PASS || 'admin' : site.adminPass;
+
+  spawnEnvs.set(`${runDir.id}:${key}`, {
+    ...siteEnv({ url: baseUrl, adminUser, adminPass }),
+    ...suite.env,
+    ...(t.env || {}),
+    // Legacy: suites that pick their environment by name rather than by URL.
+    TEST_SITE: t.site,
+    DASHBOARD_SITE: t.site,
+  });
+
+  return {
+    key,
+    suite: suiteKey,
+    suiteName: suite.name,
+    framework,
+    frameworkLabel: adapter.label,
+    language: adapter.language,
+    reportKind: adapter.reportKind,
+    scope: t.scope || null,
+    scopeName: scope ? scope.name : null,
+    site: t.site,
+    name: custom ? (t.name || t.site) : `${suite.name} · ${adapter.label}`,
+    siteName: custom ? (t.name || t.site) : site.name,
+    url: custom ? (t.url || baseUrl) : site.url,
+    baseUrl,
+    custom,
+    paths,
+    grep: t.grep || null,
+    grepIgnored,
+    status: 'queued',
+    authStatus: 'pending',
+    exitCode: null,
+    totals: emptyTotals(),
+    currentTest: null,
+    ndjson: path.join(runDir.dir, `${key}.ndjson`),
+    reportDir: path.join(runDir.dir, `${key}-report`),
+    outputDir: path.join(runDir.dir, `${key}-test-results`),
+    artifactsDir: path.join(runDir.dir, `${key}-artifacts`),
+    authLog: path.join(runDir.dir, `${key}-auth.log`),
+    log: path.join(runDir.dir, `${key}.log`),
+    tests: [],
+  };
+}
+
 /**
  * Start a run.
- * @param {Array<{site:string, paths?:string[], grep?:string}>} targets
+ * @param {Array<{suite?:string, site:string, scope?:string, paths?:string[], grep?:string}>} targets
  * @param {string} [label]
  * @returns {{id:string}}
  */
@@ -100,26 +244,31 @@ function startRun(targets, label) {
     throw new Error('No targets selected.');
   }
 
-  const clash = targets.find((t) => busySites.has(t.site));
-  if (clash) {
-    throw new Error(
-      `A run is already in progress for site "${clash.site}". ` +
-        `Wait for it to finish (one run per site at a time).`
-    );
-  }
-  for (const t of targets) {
-    // Custom targets (a single-site run against an explicit baseUrl, e.g. the
-    // PR-built site) don't need a SITES entry.
-    if (!t.baseUrl && !SITES[t.site]) throw new Error(`Unknown site: ${t.site}`);
-  }
-
   const id = makeRunId();
   const dir = store.runDir(id);
   store.ensureDir(dir);
 
+  // A composite suite's one requested target can resolve into several (one
+  // per member framework — see resolveCompositeTargets), so the busy-guard has
+  // to run against the resolved keys, not the requested ones.
+  const resolved = targets.flatMap((t) => resolveTarget(t, { id, dir }));
+
+  // One run per (suite, site[, framework]) at a time: two runs fighting over
+  // the same target would fight over its site's state, but the *same* suite
+  // against a different site — or a different suite/framework against the
+  // same site — is fine.
+  for (const r of resolved) {
+    if (busyTargets.has(r.key)) {
+      throw new Error(
+        `A run is already in progress for "${r.suiteName}" on "${r.siteName}". ` +
+          `Wait for it to finish (one run per suite + site at a time).`
+      );
+    }
+  }
+
   const run = {
     id,
-    label: label || defaultLabel(targets),
+    label: label || defaultLabel(resolved),
     trigger: 'manual',
     status: 'running',
     createdAt: new Date().toISOString(),
@@ -127,42 +276,12 @@ function startRun(targets, label) {
     finishedAt: null,
     durationMs: null,
     totals: emptyTotals(),
-    targets: targets.map((t) => {
-      // Custom = single-site run against an explicit baseUrl (the PR-built site);
-      // otherwise a configured THRIVE_SITE.
-      const custom = !!t.baseUrl;
-      const cfg = custom ? null : SITES[t.site];
-      const paths =
-        Array.isArray(t.paths) && t.paths.length
-          ? t.paths
-          : (cfg ? cfg.testDirs.map((d) => `tests/${d}/`) : ['tests/']);
-      spawnEnvs.set(`${id}:${t.site}`, custom
-        ? { PLAYWRIGHT_BASE_URL: t.baseUrl, ...(t.env || {}) }
-        : { THRIVE_SITE: t.site });
-      return {
-        site: t.site,
-        name: custom ? (t.name || t.site) : cfg.name,
-        url: custom ? (t.url || t.baseUrl) : cfg.url,
-        paths,
-        grep: t.grep || null,
-        status: 'queued',
-        authStatus: 'pending',
-        exitCode: null,
-        totals: emptyTotals(),
-        currentTest: null,
-        ndjson: path.join(dir, `${t.site}.ndjson`),
-        reportDir: path.join(dir, `${t.site}-report`),
-        outputDir: path.join(dir, `${t.site}-test-results`),
-        authLog: path.join(dir, `${t.site}-auth.log`),
-        log: path.join(dir, `${t.site}.log`),
-        tests: [],
-      };
-    }),
+    targets: resolved,
   };
 
   active.set(id, run);
   procs.set(id, []);
-  targets.forEach((t) => busySites.set(t.site, id));
+  resolved.forEach((t) => busyTargets.set(t.key, id));
   store.saveRun(run);
 
   // Kick off asynchronously; caller gets the id immediately.
@@ -179,7 +298,7 @@ function startRun(targets, label) {
 }
 
 function defaultLabel(targets) {
-  const names = targets.map((t) => t.site);
+  const names = targets.map((t) => `${t.frameworkLabel || t.suite} → ${t.siteName || t.site}`);
   if (names.length <= 3) return names.join(', ');
   return `${names.slice(0, 3).join(', ')} +${names.length - 3} more`;
 }
@@ -188,24 +307,34 @@ async function executeRun(id) {
   const run = active.get(id);
   emit(id, { kind: 'run-start', run: snapshot(id) });
 
-  // Phase 1: authenticate each target sequentially (fast, ~5s each), in
-  // priority order (apprentice, architect, ttb, quiz first).
+  // Phase 1: run each target's auth step sequentially (fast, ~5s each), in
+  // priority order. Most suites have none — Playwright suites that log in from
+  // `globalSetup`, and Cypress/Selenium suites, authenticate inside the run —
+  // in which case the target goes straight to the test phase.
   for (const target of orderTargets(run.targets)) {
     if (run.cancelled) break;
     if (target.cancelled) continue; // cancelled while queued
+
+    const auth = authSpecFor(target, id);
+    if (!auth) {
+      target.authStatus = 'ok';
+      continue;
+    }
+
     target.status = 'authenticating';
     emit(id, { kind: 'target-update', target: slimTarget(target) });
 
-    const ok = await authenticate(id, target);
+    const ok = await authenticate(id, target, auth);
     if (run.cancelled || target.cancelled) continue; // don't clobber a cancel
     target.authStatus = ok ? 'ok' : 'failed';
     if (!ok) {
       target.status = 'error';
-      releaseSite(target.site, id); // free the site the moment auth fails
+      releaseTarget(target.key, id); // free it the moment auth fails
       emit(id, { kind: 'target-update', target: slimTarget(target) });
     }
     store.saveRun(run);
   }
+  store.saveRun(run);
 
   // Phase 2: launch tests for every authenticated target, in priority order,
   // staggered (and optionally capped) to avoid memory contention.
@@ -221,7 +350,7 @@ async function executeRun(id) {
 /**
  * Launch runTests() for each target with SITE_START_STAGGER_MS between starts,
  * honouring MAX_CONCURRENT_SITES (0 = unlimited), run.cancelled, and per-target
- * cancellation. A site cancelled while still queued here never spawns.
+ * cancellation. A target cancelled while still queued here never spawns.
  */
 async function launchWithStagger(id, targets) {
   const run = active.get(id);
@@ -273,78 +402,228 @@ function cancellableDelay(id, ms) {
   });
 }
 
-/** Authenticate one site, retrying once (per suite orchestration rules). */
-async function authenticate(id, target, attempt = 1) {
+/* --------------------------------- spawning -------------------------------- */
+
+/**
+ * A plain suite already carries its one `layout`; a composite suite carries
+ * one per member framework instead, keyed by id — this picks the right one
+ * for a resolved target, which always names a single concrete framework
+ * regardless of which kind of suite it came from.
+ */
+function layoutFor(suite, target) {
+  if (suite.layout) return suite.layout;
+  const member = (suite.frameworks || []).find((f) => f.id === target.framework);
+  return member ? member.layout : null;
+}
+
+/**
+ * Build the adapter context shared by the auth and test commands.
+ *
+ * Credentials are read back out of spawnEnvs rather than off the target record:
+ * the record is persisted to run.json, and passwords have no business being
+ * written to disk.
+ */
+function specContext(target, runId) {
+  const suite = SUITES[target.suite];
+  const env = spawnEnvs.get(`${runId}:${target.key}`) || {};
+  return {
+    suite,
+    // Unique per (run, target): adapters that share a workspace with other runs
+    // use it to tag their output. See server/frameworks/selenium.js.
+    runToken: `${runId || 'run'}-${target.key}`,
+    suiteDir: suite.dir,
+    layout: layoutFor(suite, target),
+    paths: target.paths,
+    grep: target.grepIgnored ? null : target.grep,
+    ndjsonFile: target.ndjson,
+    reportDir: target.reportDir,
+    outputDir: target.outputDir,
+    artifactsDir: target.artifactsDir,
+    authLog: target.authLog,
+    reporterPath: REPORTER_PATHS[target.framework],
+    baseUrl: target.baseUrl,
+    adminUser: env.E2E_ADMIN_USER || 'admin',
+    adminPass: env.E2E_ADMIN_PASS || 'admin',
+    siteKey: target.site,
+  };
+}
+
+function authSpecFor(target, runId) {
+  try {
+    return frameworks.get(target.framework).buildAuth(specContext(target, runId));
+  } catch (_) {
+    return null;
+  }
+}
+
+/** Authenticate one target, retrying once (per suite orchestration rules). */
+async function authenticate(id, target, auth, attempt = 1) {
   const ok = await new Promise((resolve) => {
-    const child = spawnPw({
-      args: ['--reporter=line', 'tests/auth.setup.ts'],
-      spawnEnv: spawnEnvs.get(`${id}:${target.site}`),
-      logFile: target.authLog,
-    });
-    track(id, child, target.site);
+    const child = spawnSpec(id, target, auth, target.authLog);
     child.on('close', (code) => resolve(code === 0));
     child.on('error', () => resolve(false));
   });
 
   if (!ok && attempt < 2 && !active.get(id).cancelled && !target.cancelled) {
-    return authenticate(id, target, attempt + 1);
+    return authenticate(id, target, auth, attempt + 1);
   }
   return ok;
+}
+
+function spawnSpec(id, target, spec, logFile) {
+  fs.mkdirSync(path.dirname(logFile), { recursive: true });
+  const child = spawn(spec.command, spec.args, {
+    cwd: spec.cwd,
+    env: {
+      ...process.env,
+      ...(spawnEnvs.get(`${id}:${target.key}`) || {}),
+      ...(spec.env || {}),
+    },
+    windowsHide: true,
+  });
+  track(id, child, target.key);
+  if (logFile) {
+    const out = fs.createWriteStream(logFile, { flags: 'a' });
+    child.stdout.pipe(out);
+    child.stderr.pipe(out);
+  }
+  return child;
+}
+
+/** Append one NDJSON event, in the shape the reporters emit. */
+function makeWriter(target) {
+  return (event) => {
+    try {
+      fs.appendFileSync(target.ndjson, JSON.stringify({ site: target.site, ...event }) + '\n');
+    } catch (_) {
+      // Progress reporting must never break a run.
+    }
+  };
+}
+
+/**
+ * Frameworks whose reporters can't produce an up-front plan get one written for
+ * them from static discovery, so the Live view can list every test as pending
+ * before the run gets to it.
+ */
+async function writePlan(target) {
+  const adapter = frameworks.get(target.framework);
+  if (adapter.emitsPlan) return;
+  const write = makeWriter(target);
+  let tests = [];
+  try {
+    const suite = SUITES[target.suite];
+    // collectPlan() reads suite.framework/suite.layout directly; a composite
+    // suite carries neither (it has `frameworks`), so hand it a single-
+    // framework view scoped to this target's own member.
+    const suiteView = suite.frameworks
+      ? { ...suite, framework: target.framework, layout: layoutFor(suite, target) }
+      : suite;
+    tests = await frameworks.collectPlan(
+      suiteView,
+      target.paths,
+      target.grepIgnored ? null : target.grep
+    );
+  } catch (_) {
+    tests = [];
+  }
+  const ts = Date.now();
+  write({ type: 'begin', totalTests: tests.length, ts });
+  write({ type: 'plan', tests, ts });
 }
 
 /** Run the test step for one target, tailing its NDJSON for live progress. */
 function runTests(id, target) {
   return new Promise((resolve) => {
     const run = active.get(id);
+    const adapter = frameworks.get(target.framework);
     target.status = 'running';
     emit(id, { kind: 'target-update', target: slimTarget(target) });
 
-    const reporterArg = `--reporter=line,html,${REPORTER_PATH}`;
-    const args = [reporterArg, `--output=${target.outputDir}`, ...target.paths];
-    if (target.grep) args.push(`--grep=${target.grep}`);
+    let spec;
+    try {
+      fs.mkdirSync(target.artifactsDir, { recursive: true });
+      spec = adapter.buildRun(specContext(target, id));
+      runSpecs.set(`${id}:${target.key}`, spec);
+    } catch (err) {
+      target.status = 'error';
+      target.error = String((err && err.message) || err);
+      releaseTarget(target.key, id);
+      emit(id, { kind: 'target-end', target: slimTarget(target) });
+      store.saveRun(run);
+      maybeFinalize(id);
+      return resolve();
+    }
 
-    const child = spawnPw({
-      args,
-      spawnEnv: spawnEnvs.get(`${id}:${target.site}`),
-      logFile: target.log,
-      extraEnv: {
-        DASHBOARD_EVENTS_FILE: target.ndjson,
-        PLAYWRIGHT_HTML_REPORT: target.reportDir,
-      },
-    });
-    track(id, child, target.site);
+    const write = makeWriter(target);
+    const tailer = makeTailer(target.ndjson, (evt) => handleEvent(id, target, evt));
 
-    const tailer = makeTailer(target.ndjson, (evt) =>
-      handleEvent(id, target, evt)
-    );
+    // Frameworks that report results out-of-band (Selenium reads Surefire's
+    // XML) get a watcher that turns them into the same event stream.
+    const progress = adapter.startProgress
+      ? adapter.startProgress({ ...specContext(target, id), ...spec }, write)
+      : null;
 
-    child.on('close', (code) => {
-      target.exitCode = code;
-      // Give the tailer a moment to drain the final 'end' line.
-      setTimeout(() => {
+    // The plan is written before the child starts so the UI has the full list
+    // from the first frame.
+    writePlan(target).finally(() => {
+      if (target.cancelled || run.cancelled) {
+        if (progress) progress.stop();
         tailer.stop();
+        return resolve();
+      }
+
+      const child = spawnSpec(id, target, spec, target.log);
+      if (adapter.onOutput) {
+        const onData = (d) => adapter.onOutput(d.toString(), spec, write);
+        child.stdout.on('data', onData);
+        child.stderr.on('data', onData);
+      }
+
+      child.on('close', (code) => {
+        target.exitCode = code;
+        // Give the tailer/watcher a moment to drain the final events.
+        setTimeout(() => {
+          if (progress) progress.stop();
+          setTimeout(() => {
+            tailer.stop();
+            if (target.status !== 'cancelled') {
+              // A target that was supposed to run tests but reported none did
+              // not pass — it never ran. Frameworks invoked in a
+              // "don't fail the build on test failures" mode (Maven) exit 0
+              // either way, so exit code alone can't be trusted here.
+              if (target.totals.total > 0 && target.totals.completed === 0) {
+                target.status = 'error';
+                target.error =
+                  target.error ||
+                  `${target.frameworkLabel} produced no test results — see the run log.`;
+              } else {
+                const failed = target.totals.failed > 0 || code !== 0;
+                target.status = failed ? 'failed' : 'passed';
+              }
+            }
+            target.currentTest = null;
+            releaseTarget(target.key, id);
+            emit(id, { kind: 'target-end', target: slimTarget(target) });
+            store.saveRun(run);
+            maybeFinalize(id);
+            resolve();
+          }, 400);
+        }, 900);
+      });
+      child.on('error', (err) => {
         if (target.status !== 'cancelled') {
-          const failed = target.totals.failed > 0 || code !== 0;
-          target.status = failed ? 'failed' : 'passed';
+          target.status = 'error';
+          target.error = String(err.message || err);
         }
-        releaseSite(target.site, id); // free the site the moment it finishes
+        if (progress) progress.stop();
+        tailer.stop();
+        releaseTarget(target.key, id);
         emit(id, { kind: 'target-end', target: slimTarget(target) });
         store.saveRun(run);
         maybeFinalize(id);
         resolve();
-      }, 900);
-    });
-    child.on('error', (err) => {
-      if (target.status !== 'cancelled') {
-        target.status = 'error';
-        target.error = String(err.message || err);
-      }
-      tailer.stop();
-      releaseSite(target.site, id);
-      emit(id, { kind: 'target-end', target: slimTarget(target) });
-      store.saveRun(run);
-      maybeFinalize(id);
-      resolve();
+      });
     });
   });
 }
@@ -356,13 +635,21 @@ function handleEvent(id, target, evt) {
   if (evt.type === 'begin') {
     target.totals.total = evt.totalTests || 0;
     recomputeRunTotals(run);
-    emit(id, { kind: 'target-begin', site: target.site, totals: target.totals });
+    emit(id, { kind: 'target-begin', target: target.key, totals: target.totals });
     return;
   }
 
   if (evt.type === 'plan') {
-    plans.set(`${id}:${target.site}`, Array.isArray(evt.tests) ? evt.tests : []);
-    emit(id, { kind: 'plan', site: target.site, tests: evt.tests || [] });
+    plans.set(`${id}:${target.key}`, Array.isArray(evt.tests) ? evt.tests : []);
+    emit(id, { kind: 'plan', target: target.key, tests: evt.tests || [] });
+    return;
+  }
+
+  // A coarse "what's executing now" signal from frameworks that can't report
+  // per-test starts (see server/frameworks/selenium.js).
+  if (evt.type === 'stage') {
+    target.currentTest = evt.title || null;
+    emit(id, { kind: 'current', target: target.key, title: target.currentTest });
     return;
   }
 
@@ -370,12 +657,15 @@ function handleEvent(id, target, evt) {
     target.currentTest = evt.title || null;
     if (!target.runningIds) target.runningIds = [];
     if (evt.id && !target.runningIds.includes(evt.id)) target.runningIds.push(evt.id);
-    emit(id, { kind: 'current', site: target.site, title: target.currentTest, id: evt.id });
+    emit(id, { kind: 'current', target: target.key, title: target.currentTest, id: evt.id });
     return;
   }
 
   if (evt.type === 'test') {
     const status = normStatus(evt.status);
+    // Guard against a duplicate result for the same test (a retried hook, or a
+    // watcher re-reading a report) inflating the counts.
+    if (evt.id && target.tests.some((t) => t.id === evt.id)) return;
     target.totals[status] += 1;
     target.totals.completed += 1;
     const test = {
@@ -394,7 +684,7 @@ function handleEvent(id, target, evt) {
     recomputeRunTotals(run);
     emit(id, {
       kind: 'test',
-      site: target.site,
+      target: target.key,
       test: {
         id: test.id,
         title: test.title,
@@ -437,9 +727,7 @@ function finalize(id) {
     if (run.cancelled) {
       run.status = 'cancelled';
     } else if (run.targets.some((t) => t.status === 'error')) {
-      run.status = run.targets.every((t) => t.status === 'error')
-        ? 'error'
-        : 'failed';
+      run.status = run.targets.every((t) => t.status === 'error') ? 'error' : 'failed';
     } else if (run.targets.some((t) => t.status === 'failed')) {
       run.status = 'failed';
     } else {
@@ -450,14 +738,15 @@ function finalize(id) {
   store.saveRun(run);
   emit(id, { kind: 'run-end', run: snapshot(id) });
 
-  run.targets.forEach((t) => releaseSite(t.site, id));
+  run.targets.forEach((t) => releaseTarget(t.key, id));
   procs.delete(id);
   // Keep the snapshot briefly so late SSE reconnects still see it.
   setTimeout(() => {
     active.delete(id);
     run.targets.forEach((t) => {
-      plans.delete(`${id}:${t.site}`);
-      spawnEnvs.delete(`${id}:${t.site}`);
+      plans.delete(`${id}:${t.key}`);
+      spawnEnvs.delete(`${id}:${t.key}`);
+      runSpecs.delete(`${id}:${t.key}`);
     });
   }, 30000);
 }
@@ -477,23 +766,23 @@ function cancelRun(id) {
 }
 
 /**
- * Cancel ONE site within a run: kill just that site's child process(es), mark
- * the target cancelled, free it from busySites immediately (so a new run can
- * re-target it right away), and finalize the run if nothing else is still
- * active. Does not affect the other sites. Returns false if unknown/terminal.
+ * Cancel ONE target within a run: kill just its child process(es), mark it
+ * cancelled, free it immediately (so a new run can re-target it right away), and
+ * finalize the run if nothing else is still active. Does not affect the other
+ * targets. Returns false if unknown/terminal.
  */
-function cancelSite(id, site) {
+function cancelTarget(id, key) {
   const run = active.get(id);
   if (!run) return false;
-  const target = run.targets.find((t) => t.site === site);
+  const target = run.targets.find((t) => t.key === key || t.site === key);
   if (!target || isTerminal(target.status)) return false;
 
   target.cancelled = true; // stops a queued spawn / auth retry
   target.status = 'cancelled';
-  for (const child of (procs.get(id) || []).filter((c) => c._site === site)) {
+  for (const child of (procs.get(id) || []).filter((c) => c._target === target.key)) {
     killTree(child); // idempotent; guarded against double-kill
   }
-  releaseSite(site, id);
+  releaseTarget(target.key, id);
   emit(id, { kind: 'target-end', target: slimTarget(target) });
   store.saveRun(run);
   maybeFinalize(id);
@@ -502,9 +791,9 @@ function cancelSite(id, site) {
 
 /**
  * Finalize the run once Phase 2 has finished launching AND every target has
- * reached a terminal state. Guarded so an early-terminal site (e.g. a per-site
- * cancel or an auth failure) never finalizes the run while others are still
- * queued in the stagger.
+ * reached a terminal state. Guarded so an early-terminal target (e.g. a
+ * per-target cancel or an auth failure) never finalizes the run while others are
+ * still queued in the stagger.
  */
 function maybeFinalize(id) {
   const run = active.get(id);
@@ -515,9 +804,9 @@ function maybeFinalize(id) {
 
 /**
  * Stop everything when the server is shutting down (Ctrl+C / SIGTERM).
- * Synchronously kills every tracked child so multi-hour Playwright runs don't
- * keep running headless after the dashboard is gone, and records any in-flight
- * run as 'interrupted' on disk. Its NDJSON still holds the detail, which
+ * Synchronously kills every tracked child so long runs don't keep going
+ * headless after the dashboard is gone, and records any in-flight run as
+ * 'interrupted' on disk. Its NDJSON still holds the detail, which
  * recoverInterrupted() replays on the next boot.
  */
 function shutdown() {
@@ -538,36 +827,17 @@ function shutdown() {
 
 /* ----------------------------- process helpers ---------------------------- */
 
-function spawnPw({ args, spawnEnv, logFile, extraEnv }) {
-  const fullArgs = [PLAYWRIGHT_CLI, 'test', `--config=${PLAYWRIGHT_CONFIG}`, ...args];
-  const child = spawn(process.execPath, fullArgs, {
-    cwd: SUITE_DIR,
-    // PLAYWRIGHT_HTML_OPEN=never: our CLI `--reporter=...,html,...` overrides the
-    // suite config's reporter (incl. its `open:'never'`), and a CLI html reporter
-    // defaults to `open:'on-failure'` — which serves the report and blocks on
-    // "Press Ctrl+C to quit" forever, so a failed run's process never exits and
-    // the run never finalizes. Forcing 'never' here keeps the process short-lived.
-    // (Not CI=1 — that would also enable retries and break the 1-event-per-test
-    // assumption the live counts rely on.)
-    env: { ...process.env, PLAYWRIGHT_HTML_OPEN: 'never', ...(spawnEnv || {}), ...(extraEnv || {}) },
-    windowsHide: true,
-  });
-  if (logFile) {
-    const out = fs.createWriteStream(logFile, { flags: 'a' });
-    child.stdout.pipe(out);
-    child.stderr.pipe(out);
-  }
-  return child;
-}
-
-function track(id, child, site) {
-  child._site = site || null; // tag so cancelSite can target one site's process
+function track(id, child, targetKeyValue) {
+  child._target = targetKeyValue || null; // tag so cancelTarget can kill one target
   const list = procs.get(id);
   if (list) list.push(child);
 }
 
 /**
- * Forcibly kill a child and its descendants (Playwright spawns browser procs).
+ * Forcibly kill a child and its descendants — every framework here spawns a
+ * process tree (browsers for Playwright/Cypress; a forked Surefire JVM plus
+ * chromedriver and Chrome for Selenium).
+ *
  * Pass { sync:true } during shutdown so the kill is actually issued before the
  * server process exits — an async spawn would be abandoned by process.exit().
  */
@@ -642,20 +912,33 @@ function makeTailer(file, onLine) {
 
 function slimTarget(t) {
   return {
+    key: t.key,
+    suite: t.suite,
+    suiteName: t.suiteName,
+    framework: t.framework,
+    frameworkLabel: t.frameworkLabel,
+    language: t.language,
+    reportKind: t.reportKind,
     site: t.site,
+    siteName: t.siteName,
+    url: t.url,
     name: t.name,
+    scope: t.scope,
+    scopeName: t.scopeName,
     status: t.status,
     authStatus: t.authStatus,
     exitCode: t.exitCode,
     totals: t.totals,
     currentTest: t.currentTest,
     runningIds: t.runningIds || [],
-    // For the per-site "Re-run" button. No creds/baseUrl (those live only in
-    // spawnEnvs and are never persisted); `custom` PR-built targets can't be
-    // reconstructed generically, so the UI hides Re-run for them.
+    error: t.error,
+    // For the per-target "Re-run" button. No credentials or baseUrl (those live
+    // only in spawnEnvs and are never persisted); `custom` PR-built targets
+    // can't be reconstructed generically, so the UI hides Re-run for them.
     paths: t.paths,
     grep: t.grep || null,
-    custom: !SITES[t.site],
+    grepIgnored: !!t.grepIgnored,
+    custom: !!t.custom,
     // Full ordered list (slim, keyed by id) so a mid-run reconnect rebuilds the
     // whole list. Errors are kept only for failed tests.
     tests: t.tests.map((x) => ({
@@ -684,7 +967,7 @@ function snapshot(id) {
     totals: run.totals,
     targets: run.targets.map((t) => ({
       ...slimTarget(t),
-      plannedTests: plans.get(`${run.id}:${t.site}`) || [],
+      plannedTests: plans.get(`${run.id}:${t.key}`) || [],
     })),
   };
 }
@@ -724,6 +1007,7 @@ function replayTargetNdjson(target, file) {
 
   const totals = emptyTotals();
   const tests = [];
+  const seen = new Set();
   let sawEnd = false;
   let sawAny = false;
   let endTs = null;
@@ -738,10 +1022,13 @@ function replayTargetNdjson(target, file) {
     if (evt.type === 'begin') {
       totals.total = evt.totalTests || 0;
     } else if (evt.type === 'test') {
+      if (evt.id && seen.has(evt.id)) continue;
+      if (evt.id) seen.add(evt.id);
       const status = normStatus(evt.status);
       totals[status] += 1;
       totals.completed += 1;
       tests.push({
+        id: evt.id,
         title: evt.title,
         file: evt.file,
         line: evt.line,
@@ -767,6 +1054,9 @@ function replayTargetNdjson(target, file) {
  * process. We replay each target's NDJSON to salvage the results that were
  * never finalized, then set a faithful status: a target with an 'end' line
  * actually finished (passed/failed); one without was genuinely interrupted.
+ *
+ * Only Playwright writes an 'end' line, so for the other frameworks a target is
+ * treated as finished when every planned test produced a result.
  */
 function recoverInterrupted() {
   for (const summary of store.listRuns({ limit: 1000 })) {
@@ -781,10 +1071,13 @@ function recoverInterrupted() {
     for (const target of run.targets || []) {
       // Recompute the path from the run dir so records written with stale
       // absolute paths (or on another machine) still resolve locally.
-      const file = path.join(dir, `${target.site}.ndjson`);
+      const file = path.join(dir, `${target.key || target.site}.ndjson`);
       const { sawEnd, sawAny, endTs } = replayTargetNdjson(target, file);
+      const complete =
+        sawEnd ||
+        (target.totals.total > 0 && target.totals.completed >= target.totals.total);
 
-      if (sawEnd) {
+      if (complete) {
         target.status = target.totals.failed > 0 ? 'failed' : 'passed';
         if (endTs && endTs > latestEndTs) latestEndTs = endTs;
       } else if (sawAny || ['queued', 'authenticating', 'running'].includes(target.status)) {
@@ -818,7 +1111,7 @@ module.exports = {
   events,
   startRun,
   cancelRun,
-  cancelSite,
+  cancelTarget,
   shutdown,
   getActiveSnapshot,
   isActive,

@@ -79,7 +79,16 @@ function summarize(run) {
     durationMs: run.durationMs,
     totals: run.totals,
     targets: (run.targets || []).map((t) => ({
+      // `key` identifies one (suite, site) pair; older records predate it and
+      // fall back to the site key they were written with.
+      key: t.key || t.site,
+      suite: t.suite || null,
+      suiteName: t.suiteName || null,
+      framework: t.framework || null,
+      frameworkLabel: t.frameworkLabel || null,
+      language: t.language || null,
       site: t.site,
+      siteName: t.siteName || t.name,
       name: t.name,
       status: t.status,
       authStatus: t.authStatus,

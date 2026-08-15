@@ -47,7 +47,9 @@ function pingUrl(siteUrl, timeoutMs = 4000) {
 }
 
 /**
- * Check a list of site keys (default: all). Returns a map keyed by site key.
+ * Check a list of site keys (default: all registered sites). Returns a map
+ * keyed by site key. Sites are shared across suites, so one sweep covers every
+ * suite pointed at them.
  */
 async function checkSites(siteKeys) {
   const keys = (siteKeys && siteKeys.length ? siteKeys : Object.keys(SITES)).filter(

@@ -1,19 +1,18 @@
-# Thrive Test Dashboard — Implementation Plan
+# Automation Test Platform — Implementation Plan
 
-A local-only web dashboard to run the Thrive Themes Playwright suites, watch
+A local-only web dashboard to run configured Playwright test suites, watch
 live progress, and keep a browsable history of every run.
 
 ## Guiding principle
 
 The dashboard is a thin **orchestration + memory** layer around what is already
-done manually. It spawns the same `THRIVE_SITE=<key> npx playwright test <dir>`
+done manually. It spawns the same `TEST_SITE=<key> npx playwright test <dir>`
 processes that `scripts/run-parallel.sh` does — but driven by clicks, with every
 run recorded. It lives as a **separate sibling project** and never modifies the
 committed test suite (it only passes CLI flags + env vars at spawn time).
 
-- **Suite location** (configurable, see `config.js`):
-  `C:\Users\Mario\Local Sites\thrive-themes-automated-tests\thrive-themes-automated-tests`
-- **Dashboard location:** `C:\Users\Mario\Local Sites\test-dashboard`
+- **Suite location** (configurable via `DASHBOARD_SUITE_DIR`, see `config.js`)
+- **Sites** (configurable via `sites.config.json`, see `README.md`)
 
 ## Stack
 
@@ -119,22 +118,38 @@ serving its HTML report, leaving the run stuck at `running`:
 - `killTree` hardened: async `taskkill` now falls back to `SIGKILL` on
   error/non-zero exit; added a `{sync:true}` mode for shutdown.
 
-## PR Builder tab (2026-06-08)
+## PR Builder tab
 
-A standalone port of the Thrive PR Builder LocalWP add-on
-(`tools/local-addon-thrive-pr-builder`), so a `awesomemotive/thrive-themes` PR
-can be built and installed onto a designated Local site **from the dashboard**,
-without Local's Electron host. Mirrors the add-on's 12-stage flow.
+Builds a GitHub PR for a configured WordPress plugin/theme and installs it onto
+that project's Local site **from the dashboard**, so you can then run the suite
+against the built site without leaving the platform.
 
-- **Designated site:** `pr-builder-4platform.local` (config `PR_BUILDER.siteDomain`).
-- **What's reused verbatim** (plain shell/FS): the dedicated detached git
-  worktree (shared with the add-on's warm `~/.local-addon-thrive-pr-builder/`),
-  `git fetch origin pull/<N>/head` + base-branch merge, the release-tool source
-  patches (`patchToolsRefs`, the `style.css`→`webpack.config.js` version rule,
-  the version-validator relaxation so `100.PR<N>` stamps pass) + the Windows
-  nvm-skip `builder.js` patch, `node index.js build --products <csv>` with
-  `NODE_ENV` stripped, ZIP filter/route (TPM first, dashboard last) + `unzip`
-  into `wp-content`, and md5 verification of PR-changed files.
+- **Projects are config-driven** (`pr-builder.config.json`, gitignored — see
+  `pr-builder.config.example.json` and `server/pr-projects.js`). Each project
+  declares its `repo`, `kind` (plugin/theme), install `slug`, target Local
+  `site`, an optional `build` command + `distDir`, `exclude` paths, and the
+  `testAreas` to run afterwards. A plain PHP plugin needs no build step at all —
+  the repo *is* the plugin.
+- **Input** is a PR number *or* a pasted PR URL; a URL that names a configured
+  repo selects that project automatically (`pr-projects.parsePrRef`).
+- **Build flow** (`server/prbuilder.js` `executeBuild`):
+  1. resolve project + Local site, probe the DB, fail fast if it isn't running;
+  2. ensure a per-project clone (`gh repo clone`, so private repos work) and a
+     detached worktree under `~/.wp-pr-builder/<project>/`;
+  3. `git fetch origin pull/<N>/head` + hard reset, then merge the PR's base
+     branch — exactly like CI builds the merge commit. A real content conflict
+     is fatal with a "rebase and push" message;
+  4. run the optional `build` command with `NODE_ENV` stripped (a production
+     `NODE_ENV` makes `npm install` drop the devDeps a build needs);
+  5. copy the tree (or `distDir`) into `wp-content/{plugins,themes}/<slug>`,
+     removing the previous install first when *Clean install* is on — scoped to
+     the one folder it owns;
+  6. optionally stamp the `Version:` header of the **installed** copy so the
+     build is identifiable in wp-admin (the worktree stays pristine);
+  7. activate via wp-cli;
+  8. verify the PR's changed files landed (md5 against the worktree). Files that
+     legitimately don't land 1:1 because a build/`distDir` is in play bucket as
+     "compiled" rather than failing.
 - **The three Local-internal APIs, replaced (`server/localenv.js`):**
   1. *site → disk*: read Local's `sites.json` for web root + MySQL port + PHP
      version (keyed by domain).
@@ -145,22 +160,28 @@ without Local's Electron host. Mirrors the add-on's 12-stage flow.
   3. *site start*: can't be done standalone — we **probe the DB via wp-cli and
      fail fast** with "start it in Local first" instead.
 - **Files:** `server/prbuilder.js` (engine + SSE + per-build store under
-  `data/pr-builds/`), `server/localenv.js`, `server/pr-products.js` (product
-  tables + smart-pick), `/api/prbuilder/*` routes, the **PR Builder** tab in the
-  SPA. Same patterns as the test runner: one build at a time, child-process
-  cancel, SSE log stream with replay, graceful-shutdown + crash recovery.
+  `data/pr-builds/`), `server/pr-projects.js` (project registry + PR-ref
+  parsing), `server/localenv.js`, `/api/prbuilder/*` routes, the **PR Builder**
+  tab in the SPA. Same patterns as the test runner: one build at a time,
+  child-process cancel, SSE log stream with replay, graceful-shutdown + crash
+  recovery.
+- **Running tests on the build** reuses the orchestrator's custom-target path
+  (single-site `PLAYWRIGHT_BASE_URL` + admin creds). The target site key is
+  namespaced `pr:<projectKey>` so two projects never block each other on the
+  per-site busy guard.
 - **Limitation:** the site must already be running in Local (no standalone start).
 
 ## Possible future work
-- PR Builder: allow targeting any Local site (currently the one designated
-  site), and a standalone site-start (would need Local's CLI/process API).
+- PR Builder: a standalone site-start (would need Local's CLI/process API), and
+  a per-project "recipe" hook for repos whose build can't be expressed as a
+  single shell command.
 - Calendar click-on-future-day → pre-fill a schedule (currently schedules live
   in their own tab via cron).
 - Per-test history search across all runs; flaky detection (needs retries > 0).
-- Add Cypress / `thrive-themes-wt` suites as additional runner types.
+- Add Cypress or other suite formats as additional runner types.
 - Migrate JSON store → SQLite if history volume grows.
 
 ## Out of scope for v1 (architecture leaves room)
 
-- Cypress suites (`pr-builder-2026`, `newwwww2026`) and the `thrive-themes-wt`
-  182-spec suite — addable later as extra runner types / target roots.
+- Additional Cypress or other-framework suites — addable later as extra
+  runner types / target roots.

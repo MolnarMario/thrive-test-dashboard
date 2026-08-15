@@ -10,7 +10,6 @@
  *   - a runnable wp-cli command (bundled PHP + vendored wp-cli.phar), with the
  *     site's MySQL TCP port injected via `mysqli.default_port` (wp-config uses
  *     bare `localhost`, which would otherwise hit the default 3306).
- *   - the awesomemotive/thrive-themes monorepo checkout path.
  *
  * All of this was verified against pr-builder-4platform: bundled PHP 8.2.29 +
  * mysqli connects to 127.0.0.1:<port> and wp-cli reads the live DB.
@@ -133,41 +132,7 @@ function buildWpCli({ site, php, wpCliPhar, extensions, args, skipPlugins = true
   return { file: php.phpBin, argv };
 }
 
-function looksLikeMonorepo(dir) {
-  try {
-    return (
-      !!dir &&
-      fs.existsSync(path.join(dir, '.git')) &&
-      fs.existsSync(path.join(dir, 'tools', 'thrive-release', 'index.js'))
-    );
-  } catch (_) {
-    return false;
-  }
-}
-
-/**
- * Resolve the awesomemotive/thrive-themes checkout. Order: the add-on's saved
- * config (~/.local-addon-thrive-pr-builder/config.json) → a couple of common
- * locations → null (caller surfaces a clear setup error).
- */
-function resolveMonorepoPath() {
-  const addonConfig = path.join(os.homedir(), '.local-addon-thrive-pr-builder', 'config.json');
-  try {
-    const cfg = JSON.parse(fs.readFileSync(addonConfig, 'utf8'));
-    if (cfg && looksLikeMonorepo(cfg.monorepoPath)) return cfg.monorepoPath;
-  } catch (_) {
-    // no saved config — fall through to auto-detect
-  }
-  const candidates = [
-    path.join(os.homedir(), 'thrive-themes-develop'),
-    path.join(os.homedir(), 'development', 'thrive-themes'),
-    path.join(os.homedir(), 'thrive-themes'),
-  ];
-  for (const c of candidates) if (looksLikeMonorepo(c)) return c;
-  return null;
-}
-
-/** Git Bash on Windows (used to run git/gh/npm/unzip like the add-on does). */
+/** Git Bash on Windows (used to run git/gh/npm build commands). */
 function resolveBashPath() {
   if (process.platform !== 'win32') return '/bin/bash';
   const candidates = [
@@ -188,7 +153,5 @@ module.exports = {
   getLocalSite,
   resolvePhp,
   buildWpCli,
-  looksLikeMonorepo,
-  resolveMonorepoPath,
   resolveBashPath,
 };

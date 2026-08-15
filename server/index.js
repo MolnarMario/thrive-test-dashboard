@@ -4,7 +4,9 @@ const path = require('path');
 const fs = require('fs');
 const express = require('express');
 
-const { PORT, RUNS_DIR, SUITE_DIR, PLAYWRIGHT_CLI, PR_BUILDER } = require('../config');
+const config = require('../config');
+const { PORT, RUNS_DIR, SUITES, SITES } = config;
+const frameworks = require('./frameworks');
 const store = require('./store');
 const tree = require('./tree');
 const orchestrator = require('./orchestrator');
@@ -69,9 +71,11 @@ app.post('/api/runs/:id/cancel', (req, res) => {
   res.status(ok ? 202 : 404).json({ cancelling: ok });
 });
 
-// Cancel a single site within a run (kills just that site's process, frees it).
-app.post('/api/runs/:id/targets/:site/cancel', (req, res) => {
-  const ok = orchestrator.cancelSite(req.params.id, req.params.site);
+// Cancel a single target within a run (kills just that target's process,
+// frees it). `:target` is the "<suite>__<site>" key; a bare site key is still
+// accepted so older links keep working.
+app.post('/api/runs/:id/targets/:target/cancel', (req, res) => {
+  const ok = orchestrator.cancelTarget(req.params.id, req.params.target);
   res.status(ok ? 202 : 404).json({ cancelling: ok });
 });
 
@@ -130,21 +134,131 @@ app.get('/api/runs/:id/combined-report', (req, res) => {
 });
 
 // Serve a target's Playwright HTML report (drill-down to traces/screenshots).
-app.use('/api/runs/:id/report/:site', (req, res, next) => {
-  const dir = path.join(RUNS_DIR, req.params.id, `${req.params.site}-report`);
+// Only Playwright produces one; the other frameworks expose /artifacts instead.
+app.use('/api/runs/:id/report/:target', (req, res, next) => {
+  const dir = path.join(RUNS_DIR, req.params.id, `${req.params.target}-report`);
   if (!fs.existsSync(dir)) {
     return res.status(404).send('No report for this target.');
   }
   express.static(dir)(req, res, next);
 });
 
-// Lightweight environment / preflight info.
+/**
+ * Browse whatever a non-Playwright target left behind: Cypress failure
+ * screenshots, Surefire XML/text reports. A plain listing rather than a
+ * generated report — the framework didn't produce one, and inventing a fancier
+ * view would only hide what's actually there.
+ */
+app.get('/api/runs/:id/artifacts/:target', (req, res) => {
+  const root = path.join(RUNS_DIR, req.params.id, `${req.params.target}-artifacts`);
+  if (!fs.existsSync(root)) return res.status(404).send('No artifacts for this target.');
+
+  const files = [];
+  const walk = (dir, rel) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const abs = path.join(dir, e.name);
+      const relPath = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(abs, relPath);
+      else files.push({ path: relPath, size: fs.statSync(abs).size });
+    }
+  };
+  try { walk(root, ''); } catch (_) { /* listing is best-effort */ }
+
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const base = `/api/runs/${encodeURIComponent(req.params.id)}/artifacts/${encodeURIComponent(req.params.target)}/file`;
+  const rows = files.length
+    ? files.map((f) => `<li><a href="${base}/${f.path.split('/').map(encodeURIComponent).join('/')}">${esc(f.path)}</a> <span>${(f.size / 1024).toFixed(1)} KB</span></li>`).join('')
+    : '<li class="empty">This run produced no artifacts.</li>';
+
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">
+<title>Artifacts — ${esc(req.params.target)}</title>
+<style>body{font:14px/1.6 -apple-system,"Segoe UI",Roboto,sans-serif;margin:32px;color:#1a1a2e}
+h1{font-size:18px}ul{list-style:none;padding:0}li{padding:6px 0;border-bottom:1px solid #e3e6ec;display:flex;gap:12px}
+li span{color:#5b6472;font-size:12px;margin-left:auto}a{color:#1667c2;text-decoration:none}a:hover{text-decoration:underline}
+.empty{color:#5b6472}</style></head><body>
+<h1>Artifacts · ${esc(req.params.target)}</h1><ul>${rows}</ul></body></html>`);
+});
+
+app.use('/api/runs/:id/artifacts/:target/file', (req, res, next) => {
+  const root = path.join(RUNS_DIR, req.params.id, `${req.params.target}-artifacts`);
+  if (!fs.existsSync(root)) return res.status(404).send('No artifacts for this target.');
+  express.static(root)(req, res, next);
+});
+
+// Suites, sites and toolchain status — what the UI needs to explain the setup.
 app.get('/api/env', (_req, res) => {
   res.json({
-    suiteDir: SUITE_DIR,
-    playwrightCliExists: fs.existsSync(PLAYWRIGHT_CLI),
-    prBuilderSite: PR_BUILDER.siteDomain,
+    suites: Object.values(SUITES).map((s) => {
+      if (s.frameworks) {
+        const members = s.frameworks.map((f) => {
+          const meta = frameworks.has(f.id) ? frameworks.describe(f.id) : null;
+          const tooling = meta && f.layout.ok ? frameworks.get(f.id).checkTooling(s.dir, f.layout) : null;
+          const ok = f.layout.ok && (!tooling || tooling.ok);
+          return {
+            id: f.id,
+            label: (meta && meta.label) || f.id,
+            language: meta && meta.language,
+            ok,
+            reason: ok ? null : (f.layout.reason || (tooling && tooling.message)),
+          };
+        });
+        return {
+          key: s.key,
+          name: s.name,
+          dir: s.dir,
+          framework: null,
+          frameworks: members,
+          label: members.map((m) => m.label).join(' + '),
+          language: null,
+          ok: s.ok,
+          reason: s.reason,
+        };
+      }
+      const meta = s.framework && frameworks.has(s.framework) ? frameworks.describe(s.framework) : null;
+      const tooling = meta ? frameworks.get(s.framework).checkTooling(s.dir, s.layout) : null;
+      return {
+        key: s.key,
+        name: s.name,
+        dir: s.dir,
+        framework: s.framework,
+        label: meta && meta.label,
+        language: meta && meta.language,
+        ok: s.ok && (!tooling || tooling.ok),
+        reason: s.reason || (tooling && !tooling.ok ? tooling.message : null),
+      };
+    }),
+    sites: Object.values(SITES).map((s) => ({ key: s.key, name: s.name, url: s.url })),
   });
+});
+
+// Registered sites — the "testing pool". Credentials never leave the server.
+app.get('/api/sites', (_req, res) => {
+  res.json({
+    sites: Object.values(SITES).map((s) => ({ key: s.key, name: s.name, url: s.url, custom: !!s.custom })),
+  });
+});
+
+// Add a site from the dashboard UI; selectable in every suite's dropdown
+// immediately (config.addSite() reloads SITES/SUITES in place, no restart).
+app.post('/api/sites', (req, res) => {
+  try {
+    const site = config.addSite(req.body || {});
+    res.status(201).json({ site: { key: site.key, name: site.name, url: site.url, custom: true } });
+  } catch (err) {
+    res.status(400).json({ error: String(err.message || err) });
+  }
+});
+
+// Remove a site added through the UI. Sites from sites.config.json can't be
+// removed here — that file stays the source of truth for those.
+app.delete('/api/sites/:key', (req, res) => {
+  try {
+    config.removeSite(req.params.key);
+    res.json({ deleted: true });
+  } catch (err) {
+    res.status(400).json({ error: String(err.message || err) });
+  }
 });
 
 // Site reachability check (LocalWP up?). ?sites=a,b,c (default: all).
@@ -214,13 +328,13 @@ app.delete('/api/schedules/:id', (req, res) => {
   res.json({ deleted: true });
 });
 
-// --- PR Builder (build a thrive-themes PR onto the designated Local site) ---
+// --- PR Builder (build a configured plugin/theme PR onto its Local site) ---
 
-app.get('/api/prbuilder/milestones', async (_req, res) => {
+app.get('/api/prbuilder/projects', (_req, res) => {
   try {
-    res.json({ milestones: await prbuilder.listMilestones() });
+    res.json({ projects: prbuilder.listProjects() });
   } catch (err) {
-    res.status(502).json({ error: String(err.message || err) });
+    res.status(500).json({ error: String(err.message || err) });
   }
 });
 
@@ -228,20 +342,13 @@ app.get('/api/prbuilder/prs', async (req, res) => {
   try {
     res.json({
       prs: await prbuilder.listPRs({
-        milestoneTitle: req.query.milestone || undefined,
+        project: req.query.project || undefined,
+        state: req.query.state || undefined,
         limit: req.query.limit,
       }),
     });
   } catch (err) {
     res.status(502).json({ error: String(err.message || err) });
-  }
-});
-
-app.get('/api/prbuilder/recommend', async (req, res) => {
-  try {
-    res.json(await prbuilder.recommend(req.query.pr));
-  } catch (err) {
-    res.status(400).json({ error: String(err.message || err) });
   }
 });
 
@@ -336,19 +443,34 @@ store.ensureDir(RUNS_DIR);
 orchestrator.recoverInterrupted();
 prbuilder.recoverInterrupted();
 scheduler.init();
-// Warm the test-count cache (~6s `playwright --list`) so the tree shows exact
-// "tests that will run" without the first page load waiting on it.
+// Warm the discovery cache (Playwright's `--list` takes a few seconds) so the
+// tree shows exact "tests that will run" without the first page load waiting.
 tree.getTree().catch(() => {});
 
 app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`\n  Thrive Test Dashboard → http://localhost:${PORT}\n`);
-  if (!fs.existsSync(PLAYWRIGHT_CLI)) {
-    console.warn(
-      `  WARNING: Playwright CLI not found at:\n    ${PLAYWRIGHT_CLI}\n` +
-        `  Check DASHBOARD_SUITE_DIR / that the suite has node_modules installed.\n`
+  /* eslint-disable no-console */
+  console.log(`\n  Automation Test Platform → http://localhost:${PORT}\n`);
+  for (const suite of Object.values(SUITES)) {
+    if (suite.frameworks) {
+      const labels = suite.frameworks.map((f) => (frameworks.has(f.id) ? frameworks.get(f.id).label : f.id));
+      console.log(
+        `  ${suite.ok ? '✓' : '✗'} ${suite.key.padEnd(16)} ${labels.join('+').padEnd(11)} ${suite.dir}`
+      );
+      if (!suite.ok) console.warn(`      ${suite.reason}`);
+      continue;
+    }
+    const fw = suite.framework && frameworks.has(suite.framework)
+      ? frameworks.get(suite.framework)
+      : null;
+    const tooling = fw ? fw.checkTooling(suite.dir, suite.layout) : { ok: false, message: 'unknown framework' };
+    const ok = suite.ok && tooling.ok;
+    console.log(
+      `  ${ok ? '✓' : '✗'} ${suite.key.padEnd(16)} ${(fw ? fw.label : suite.framework || '?').padEnd(11)} ${suite.dir}`
     );
+    if (!ok) console.warn(`      ${suite.reason || tooling.message}`);
   }
+  console.log('');
+  /* eslint-enable no-console */
 });
 
 /* ------------------------------- shutdown --------------------------------- */

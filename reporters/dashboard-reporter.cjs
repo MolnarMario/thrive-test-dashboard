@@ -31,7 +31,7 @@ function titleOf(test) {
 class DashboardReporter {
   constructor() {
     this.file = process.env.DASHBOARD_EVENTS_FILE || '';
-    this.site = process.env.THRIVE_SITE || '';
+    this.site = process.env.TEST_SITE || '';
     this.startTs = Date.now();
   }
 
