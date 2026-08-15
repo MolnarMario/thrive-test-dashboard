@@ -54,13 +54,17 @@ function statusClass(status) {
   return 'muted';
 }
 
-/** Strip the noisy "chromium › <spec path> › " prefix Playwright puts on titles. */
+/**
+ * Normalise a test title across frameworks: Playwright joins its path with " › "
+ * and prefixes the project and spec file; the Cypress and Selenium adapters use
+ * " > ". Strip the noise, keep the readable part.
+ */
 function cleanTitle(title) {
-  const parts = String(title || '').split(' › ');
+  const parts = String(title || '').split(/\s+[›>]\s+/);
   // Drop the leading project name ("chromium") and the spec-file segment.
   const trimmed = parts.filter((p, i) => {
     if (i === 0 && /^[a-z-]+$/i.test(p) && !p.includes(' ')) return false; // project
-    if (/\.spec\.[tj]s$/i.test(p)) return false;                          // file path
+    if (/\.(spec|cy)\.[tj]s$/i.test(p)) return false;                     // file path
     return true;
   });
   return (trimmed.length ? trimmed : parts).join(' › ');
@@ -92,15 +96,25 @@ function productSection(run, t) {
     ? `<div class="note">${t.authStatus === 'failed' ? 'Authentication failed' : 'Did not run'} — no tests were executed for this product.</div>`
     : '';
 
-  const reportLink = `<a class="pw-link" href="/api/runs/${esc(run.id)}/report/${esc(t.site)}/index.html" target="_blank" rel="noopener">↗ Open Playwright report</a>`;
+  // Only Playwright writes an HTML report; the others get a listing of whatever
+  // artifacts they left behind (Cypress screenshots, Surefire XML).
+  const key = t.key || t.site;
+  const reportLink = t.reportKind === 'artifacts'
+    ? `<a class="pw-link" href="/api/runs/${esc(run.id)}/artifacts/${esc(key)}" target="_blank" rel="noopener">↗ Artifacts</a>`
+    : `<a class="pw-link" href="/api/runs/${esc(run.id)}/report/${esc(key)}/index.html" target="_blank" rel="noopener">↗ Open Playwright report</a>`;
+
+  const fw = t.frameworkLabel
+    ? `<span class="fw">${esc(t.frameworkLabel)}${t.language ? ` · ${esc(t.language)}` : ''}</span>`
+    : '';
 
   return `
     <section class="product">
       <div class="product-head">
-        <h3>${esc(t.name || t.site)}</h3>
+        <h3>${esc(t.suiteName || t.name || t.site)}</h3>
+        ${fw}
         <span class="badge ${sc}">${esc(t.status || 'unknown')}</span>
         <span class="spacer"></span>
-        <span class="url">${esc(t.url || '')}</span>
+        <span class="url">${esc(t.siteName ? `${t.siteName} — ` : '')}${esc(t.url || '')}</span>
       </div>
       <div class="counts">
         <span class="c pass">✓ ${tt.passed}</span>
@@ -122,7 +136,7 @@ function buildCombinedReportHtml(run) {
   const rc = statusClass(run.status);
 
   const tiles = [
-    ['Products', products.length, ''],
+    ['Targets', products.length, ''],
     ['Tests', rt.completed + (rt.total && rt.total > rt.completed ? `/${rt.total}` : ''), ''],
     ['Passed', rt.passed, 'ok'],
     ['Failed', rt.failed, 'bad'],
@@ -160,6 +174,7 @@ function buildCombinedReportHtml(run) {
   .product { border:1px solid var(--line); border-radius:12px; padding:16px 18px; margin:0 0 14px; break-inside:avoid; page-break-inside:avoid; }
   .product-head { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
   .product-head h3 { margin:0; font-size:16px; }
+  .fw { font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); background:var(--bg); border:1px solid var(--line); border-radius:20px; padding:2px 9px; }
   .spacer { flex:1; }
   .url { font-family:ui-monospace,Consolas,monospace; font-size:11px; color:var(--muted); }
   .counts { display:flex; align-items:center; gap:14px; font-size:13px; font-variant-numeric:tabular-nums; padding:6px 0; border-top:1px solid var(--line); }
@@ -198,9 +213,9 @@ function buildCombinedReportHtml(run) {
 
   <div class="tiles">${tiles}</div>
 
-  ${sections || '<p class="note">This run has no products.</p>'}
+  ${sections || '<p class="note">This run has no targets.</p>'}
 
-  <footer>Generated from run data on demand · ${esc(products.length)} product(s). For traces &amp; screenshots, open a product's Playwright report. Print to PDF with Ctrl/⌘+P.</footer>
+  <footer>Generated from run data on demand · ${esc(products.length)} target(s). For traces &amp; screenshots, open a target's report or artifacts. Print to PDF with Ctrl/⌘+P.</footer>
 </div></body></html>`;
 }
 

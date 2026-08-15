@@ -1,10 +1,30 @@
 # Automation Test Platform
 
-A local web UI to run Playwright test suites, watch live progress, and browse
-a history of past runs. It wraps per-site `TEST_SITE=<key> playwright test
-<dir>` runs — it never modifies the test suite itself.
+A local web UI to run end-to-end test suites, watch live progress, and browse a
+history of past runs. It is **framework-agnostic**: Playwright, Cypress and
+Selenium suites all run through the same dashboard, with the same live per-test
+progress and the same history. It never modifies the suites themselves.
+
+| Framework | Language | Specs | Runner |
+| --- | --- | --- | --- |
+| Playwright | TypeScript | `*.spec.ts` | `playwright test` |
+| Cypress | TypeScript | `*.cy.ts` | `cypress run` |
+| Selenium | Java | `*Test.java` | JUnit 5 via Maven Surefire |
 
 See [PLAN.md](./PLAN.md) for the full design and roadmap.
+
+## The model: suites × sites
+
+Two independent lists, and the run matrix is their product:
+
+- **A suite** says *how* to run — a directory plus which framework it uses.
+- **A site** says *where* to run — a URL plus admin credentials.
+
+Every suite is handed `E2E_BASE_URL`, `E2E_ADMIN_USER` and `E2E_ADMIN_PASS`, so
+any suite that reads those can be pointed at any registered site from the
+dropdown on its row in the Run tab. One run per (suite, site) pair at a time is
+enforced; the same suite against two different sites, or two frameworks against
+the same site, run happily in parallel.
 
 ## Quick start
 
@@ -13,29 +33,55 @@ npm install        # installs express (only dependency)
 npm start          # → http://localhost:4400
 ```
 
-Then open **http://localhost:4400**.
+Then open **http://localhost:4400**. On boot it prints one line per configured
+suite saying whether it is runnable, and why not if it isn't.
 
 Prerequisites:
 
 - The sites you want to test **must be running** before you start a run.
-- The Playwright suite (see `DASHBOARD_SUITE_DIR` below) must have its
-  `node_modules` installed.
+- Node suites (Playwright, Cypress) need their own `node_modules` installed.
+- Selenium suites need a JDK and Maven. Neither has to be on `PATH` — the
+  dashboard looks in the usual install locations, and `DASHBOARD_JAVA_HOME` /
+  `DASHBOARD_MAVEN_HOME` override the search.
 
 ## How it works
 
-- **Run tab** — pick whole sites, folders, or individual specs from the tree,
-  optionally add a `--grep` keyword, and hit **Run selected**. Each selected
-  site becomes one parallel Playwright process (one run per site at a time is
-  enforced).
-- **Live tab** — per-site cards with a progress bar, pass/fail/skip counts, the
-  currently-running test, and failures as they happen. Survives page reloads
-  (SSE reconnects). Cancel stops the processes.
-- **History tab** — every run is recorded under `data/runs/<id>/`. Click a run
-  to see per-site results, failures, and a link to that site's full Playwright
-  HTML report (with traces/screenshots).
+- **Run tab** — the tree is grouped by suite, each labelled with its framework
+  and language. Pick a whole suite, a folder, or individual specs; choose which
+  registered site to run it against from the dropdown on the suite's row; hit
+  **Run selected**. Each selected (suite, site) pair becomes one OS process.
+- **Live tab** — a card per target with a progress bar, pass/fail/skip counts,
+  the currently-running test, and failures as they happen. Survives page
+  reloads (SSE reconnects). Cancel stops the process tree, per target or for
+  the whole run.
+- **History tab** — every run is recorded under `data/runs/<id>/`, filterable by
+  site and by framework. Click a run for per-target results, failures, and a
+  link to that target's Playwright report or artifacts.
+- **Calendar / Schedules** — runs by day, and cron schedules that fire while the
+  dashboard is running. A schedule picks (suite, site) pairs just like the Run
+  tab does.
 - **PR Builder tab** — paste a GitHub PR number or link for a configured
   plugin/theme project; it builds that PR and installs it onto the project's
-  Local site, then lets you run the suite against it (see below).
+  Local site, then lets you run any configured suite against it (see below).
+
+### What each framework can and can't do
+
+The adapters normalise as much as is honest, and the UI says so where they
+differ:
+
+| | Playwright | Cypress | Selenium |
+| --- | --- | --- | --- |
+| Test counts in the tree | exact (`--list`) | parsed from source | parsed from source |
+| Live progress | per test | per test | per test, arriving a class at a time |
+| Keyword filter | `--grep` | **not supported** | resolved to explicit `Class#method` |
+| Failure detail | HTML report + traces | screenshots | Surefire reports |
+
+Cypress has no CLI title filter at all, so a keyword is ignored for it rather
+than silently running more than you asked for — the Run tab warns when that
+applies to your selection. Select specs instead.
+
+Selenium results arrive a test class at a time, because Maven Surefire flushes
+its report once per class; the card shows which class is executing in between.
 
 ## PR Builder
 
@@ -71,51 +117,98 @@ Copy [`sites.config.example.json`](./sites.config.example.json) to
 
 ```json
 {
-  "suiteDir": "../my-plugin/e2e-playwright",
   "sites": {
     "my-site": {
       "name": "My Site",
       "url": "http://my-site.local",
-      "testDirs": ["."]
+      "adminUser": "admin",
+      "adminPass": "admin"
+    }
+  },
+  "suites": {
+    "e2e-playwright": {
+      "name": "End-to-end",
+      "framework": "playwright",
+      "dir": "../my-plugin/e2e-playwright",
+      "defaultSite": "my-site"
     }
   }
 }
 ```
 
-- `suiteDir` — path to the Playwright suite root, relative to the dashboard.
-  Optional; if omitted the dashboard looks for a suite next to it.
-- `sites` — one entry per test area: `key: { name, url, testDirs }`. `testDirs`
-  are relative to the tests root; use `["."]` when the specs sit directly in
-  the tests root rather than in per-site subfolders.
+**Sites** — `key: { name, url, adminUser, adminPass }`. Registered once and
+offered to every suite.
 
-**Suite layout** is auto-detected — both of these work with no configuration:
+**Suites** — `key: { name, framework, dir, … }`:
+
+| field | meaning |
+| --- | --- |
+| `framework` | `playwright`, `cypress` or `selenium`. Omit to auto-detect from the files on disk. |
+| `dir` | suite root, relative to the dashboard |
+| `sites` | optional allow-list of site keys this suite may target (default: all) |
+| `defaultSite` | the site preselected in the dropdown |
+| `env` | extra environment variables for this suite's runs |
+| `scopes` | split one suite into separately selectable slices, each with its own default site — for a suite whose specs are organised per product or tenant |
+
+**Suite layouts** are auto-detected:
 
 ```
-<suite>/playwright.config.ts             <suite>/.playwright/playwright.config.ts
-<suite>/tests/…                          <suite>/.playwright/tests/…
+playwright   <suite>/playwright.config.ts  + tests/   (or .playwright/…)
+cypress      <suite>/cypress.config.ts     + cypress/e2e/
+selenium     <suite>/pom.xml               + src/test/java/
 ```
 
-**Authentication** — if the suite has `<tests root>/auth.setup.ts`, it runs
-once per site before the tests. If it doesn't (e.g. the suite logs in from
-Playwright's `globalSetup`), that phase is skipped automatically.
+**Making a suite site-agnostic** — read the base URL and credentials from the
+environment instead of hardcoding them, and the site dropdown just works:
 
-Env overrides, if auto-detection guesses wrong:
+```ts
+// Playwright / Cypress config
+baseURL: process.env.E2E_BASE_URL || 'http://my-site.local'
+```
 
-- `DASHBOARD_SUITE_DIR`, `DASHBOARD_PLAYWRIGHT_CONFIG`, `DASHBOARD_TESTS_ROOT`
-- `DASHBOARD_AUTH_SETUP` — a spec path, or empty to skip the auth phase
+```java
+// Selenium — system property first, then environment variable
+String url = System.getProperty("E2E_BASE_URL", System.getenv("E2E_BASE_URL"));
+```
+
+**Authentication** — if a Playwright suite has `<tests root>/auth.setup.ts`, it
+runs once per target before the tests. Suites that log in inside the run
+(Playwright's `globalSetup`, a Cypress `cy.session` command, a JUnit
+`@BeforeAll`) skip that phase automatically.
+
+The older single-suite config shape (`suiteDir`, with `testDirs` on each site)
+is still read and upgraded in memory, so existing installs keep working: the
+suite becomes one entry, and each site's `testDirs` becomes a scope.
+
+Env overrides:
+
+- `DASHBOARD_JAVA_HOME`, `DASHBOARD_MAVEN_HOME` — JVM toolchain locations
+- `SITE_START_STAGGER_MS`, `MAX_CONCURRENT_SITES`, `SITE_START_PRIORITY`
 - `PORT` — HTTP port (default `4400`)
 
 ## Data layout
 
+Files are keyed by `<target>` = `<suiteKey>__<siteKey>`, so a single run can
+hold several frameworks against several sites without collision.
+
 ```
 data/runs/<runId>/
-  run.json              # canonical run record (status, totals, per-test results)
-  <site>.ndjson         # live event stream from the custom reporter
-  <site>.log            # full Playwright stdout/stderr
-  <site>-auth.log       # auth step output
-  <site>-report/        # Playwright HTML report (served in the UI)
-  <site>-test-results/  # traces / screenshots
+  run.json                 # canonical run record (status, totals, per-test results)
+  <target>.ndjson          # live event stream — one format for every framework
+  <target>.log             # full runner stdout/stderr
+  <target>-auth.log        # auth step output, when the suite has one
+  <target>-report/         # Playwright HTML report (served in the UI)
+  <target>-test-results/   # Playwright traces / screenshots
+  <target>-artifacts/      # Cypress screenshots, Surefire reports
 ```
+
+## Adding another framework
+
+Drop a module in `server/frameworks/` implementing `detect`, `checkTooling`,
+`discover` and `buildRun` (plus optional `buildAuth`, `startProgress`,
+`onOutput`), then register it in `server/frameworks/index.js` — that file
+documents the interface. Nothing outside `server/frameworks/` knows or cares
+which framework a suite uses.
 
 ## Roadmap
 

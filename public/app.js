@@ -98,7 +98,13 @@ function rerunnable(run) {
 async function rerunRun(id) {
   try {
     const { run } = await api(`/api/runs/${id}`);
-    const targets = (run.targets || []).map((t) => ({ site: t.site, paths: t.paths, grep: t.grep || undefined }));
+    const targets = (run.targets || []).map((t) => ({
+      suite: t.suite || undefined,
+      scope: t.scope || undefined,
+      site: t.site,
+      paths: t.paths,
+      grep: t.grep || undefined,
+    }));
     if (!targets.length) return alert('Nothing to re-run.');
     const { id: newId } = await api('/api/runs', {
       method: 'POST',
@@ -137,9 +143,121 @@ $$('.tab').forEach((t) => t.addEventListener('click', () => showTab(t.dataset.ta
 
 /* ----------------------------------- tree ---------------------------------- */
 
+/**
+ * The Run tab is a table with one row per selectable thing, so a suite's
+ * identity is readable by column rather than crammed into one label: what it's
+ * called, which framework and language it's written in, how much it contains,
+ * and which registered site it will run against.
+ *
+ * A run target is a (suite, scope, site, paths) tuple — which suite's tests, and
+ * which environment to point them at — so the site dropdown lives on the same
+ * row as the thing it applies to.
+ *
+ * Selection and expansion live in STATE, not in the DOM: the table is rebuilt
+ * from the model on every change. Rows are few (a suite plus its specs), and
+ * deriving the view from one source of truth avoids the usual tree-widget bugs
+ * where a checkbox and the thing it represents drift apart.
+ */
+
 let TREE = null;
-const siteDots = {}; // site key -> status dot element
+let STATE = []; // per-suite selection/expansion state, see buildState()
+let SITE_STATUS = {}; // site key -> last preflight result
 let HISTORY = []; // cached run summaries for client-side filtering
+let SORT = { key: null, dir: 1 }; // null key = configuration order
+
+const COLUMNS = [
+  { key: 'name', label: 'Name' },
+  { key: 'fw', label: 'Framework' },
+  { key: 'lang', label: 'Language' },
+  { key: 'count', label: 'Specs / Tests' },
+  { key: 'site', label: 'Site' },
+  { key: 'status', label: 'Site status' },
+];
+
+/** Reachability, worst-last, so "Site status" sorts into up → down → unknown. */
+function statusRank(siteKey) {
+  const s = SITE_STATUS[siteKey];
+  if (!s || s.checking) return 2;
+  return s.up ? 0 : 1;
+}
+
+function siteUrl(siteKey) {
+  const site = TREE && TREE.sites.find((s) => s.key === siteKey);
+  return site ? site.url : siteKey || '';
+}
+
+/**
+ * The value a row sorts by. Suites and scopes share the comparator, so a
+ * multi-scope suite sorts its scopes the same way the table sorts its suites.
+ */
+function sortValue(key, { suite, scope, site, name }) {
+  switch (key) {
+    case 'name': return (name || '').toLowerCase();
+    case 'fw': return (suite.label || suite.framework ||
+      (suite.frameworks || []).map((f) => f.label || f.id).join('+') || '').toLowerCase();
+    case 'lang': return (suite.language ||
+      (suite.frameworks || []).map((f) => f.language).filter(Boolean).join('+') || '').toLowerCase();
+    case 'count': return (scope ? scope.testCount : suite.testCount) || 0;
+    case 'site': return siteUrl(site).toLowerCase();
+    case 'status': return statusRank(site);
+    default: return 0;
+  }
+}
+
+/**
+ * Ties break on framework then name, always ascending, so sorting by a column
+ * several rows share (three suites of the same project all named the same, say)
+ * still produces a stable, predictable order rather than an arbitrary one.
+ */
+function compareBy(key, dir) {
+  return (a, b) => {
+    const av = sortValue(key, a);
+    const bv = sortValue(key, b);
+    if (av < bv) return -1 * dir;
+    if (av > bv) return 1 * dir;
+    for (const tie of ['fw', 'name']) {
+      const ta = sortValue(tie, a);
+      const tb = sortValue(tie, b);
+      if (ta < tb) return -1;
+      if (ta > tb) return 1;
+    }
+    return 0;
+  };
+}
+
+/** Cycle a column: ascending → descending → back to configuration order. */
+function toggleSort(key) {
+  if (SORT.key !== key) SORT = { key, dir: 1 };
+  else if (SORT.dir === 1) SORT = { key, dir: -1 };
+  else SORT = { key: null, dir: 1 };
+  renderTree();
+}
+
+/**
+ * STATE in display order. Sorting reorders suites, and the scopes inside a
+ * multi-scope suite — never the spec rows, which stay with their parent in the
+ * order the framework reports them.
+ */
+function sortedState() {
+  const rows = STATE.map((st) => ({
+    st,
+    suite: st.suite,
+    scope: st.scopes.length === 1 ? st.scopes[0].scope : null,
+    site: st.scopes.length === 1 ? st.scopes[0].site : (st.scopes[0] || {}).site,
+    name: st.suite.name,
+  }));
+  if (!SORT.key) return STATE;
+  rows.sort(compareBy(SORT.key, SORT.dir));
+  return rows.map((r) => r.st);
+}
+
+function sortedScopes(st) {
+  if (!SORT.key || st.scopes.length < 2) return st.scopes;
+  return st.scopes
+    .map((sc) => ({ sc, suite: st.suite, scope: sc.scope, site: sc.site, name: sc.scope.name }))
+    .sort(compareBy(SORT.key, SORT.dir))
+    .map((r) => r.sc);
+}
 
 async function loadTree(refresh = false) {
   $('#tree').textContent = 'Loading test tree…';
@@ -149,124 +267,368 @@ async function loadTree(refresh = false) {
     $('#tree').innerHTML = `<div class="error-banner">Could not load tree: ${err.message}</div>`;
     return;
   }
+  STATE = buildState(STATE);
   renderTree();
 }
+
+/* --------------------------------- model ---------------------------------- */
+
+function makeNode(node) {
+  return { node, checked: false, open: false, children: (node.children || []).map(makeNode) };
+}
+
+/**
+ * Build fresh state from the loaded tree. Site choices are carried over from the
+ * previous state so a Rescan doesn't reset which site each suite points at.
+ */
+function buildState(previous) {
+  const keptSites = new Map();
+  for (const st of previous || []) {
+    for (const sc of st.scopes) keptSites.set(`${st.key}:${sc.key}`, sc.site);
+  }
+  return TREE.suites.map((suite) => ({
+    key: suite.key,
+    suite,
+    scopes: (suite.scopes || []).map((scope) => ({
+      key: scope.key,
+      scope,
+      suite,
+      site:
+        keptSites.get(`${suite.key}:${scope.key}`) ||
+        scope.defaultSite ||
+        (suite.sites[0] || {}).key ||
+        '',
+      open: false,
+      children: (scope.children || []).map(makeNode),
+    })),
+  }));
+}
+
+/** Every spec file under a node (a file node is its own only leaf). */
+function leavesOf(ns) {
+  return ns.children.length ? ns.children.flatMap(leavesOf) : [ns];
+}
+
+function setChecked(ns, value) {
+  ns.checked = value;
+  for (const child of ns.children) setChecked(child, value);
+}
+
+function fullyChecked(ns) {
+  const leaves = leavesOf(ns);
+  return leaves.length > 0 && leaves.every((l) => l.checked);
+}
+
+function partlyChecked(ns) {
+  const leaves = leavesOf(ns);
+  return leaves.some((l) => l.checked) && !leaves.every((l) => l.checked);
+}
+
+function scopeLeaves(sc) {
+  return sc.children.flatMap(leavesOf);
+}
+
+function setScopeChecked(sc, value) {
+  for (const child of sc.children) setChecked(child, value);
+}
+
+function forEachScope(fn) {
+  for (const st of STATE) for (const sc of st.scopes) fn(sc, st);
+}
+
+/**
+ * What one scope contributes to a run: the whole scope when everything under it
+ * is selected, otherwise the highest fully-selected nodes (so picking a folder
+ * sends the folder, not each file inside it).
+ */
+function collectScopeSelection(sc) {
+  const base = { suite: sc.suite.key, scope: sc.key, site: sc.site };
+  const leaves = scopeLeaves(sc);
+  if (leaves.length && leaves.every((l) => l.checked)) {
+    return {
+      ...base,
+      paths: sc.scope.filters,
+      specCount: sc.scope.specCount,
+      testCount: sc.scope.testCount || 0,
+    };
+  }
+
+  const paths = [];
+  let specCount = 0;
+  let testCount = 0;
+  const walk = (ns) => {
+    if (fullyChecked(ns)) {
+      paths.push(ns.node.filter);
+      specCount += ns.node.specCount;
+      testCount += ns.node.testCount || 0;
+      return;
+    }
+    ns.children.forEach(walk);
+  };
+  sc.children.forEach(walk);
+  return { ...base, paths, specCount, testCount };
+}
+
+function suiteOf(key) {
+  return TREE && TREE.suites.find((s) => s.key === key);
+}
+
+function selectedSuites() {
+  const keys = new Set();
+  forEachScope((sc, st) => {
+    if (collectScopeSelection(sc).specCount > 0) keys.add(st.key);
+  });
+  return TREE.suites.filter((s) => keys.has(s.key));
+}
+
+function buildTargets() {
+  const grep = $('#grepInput').value.trim() || undefined;
+  const targets = [];
+  forEachScope((sc) => {
+    const sel = collectScopeSelection(sc);
+    if (sel.specCount > 0 && sel.site) {
+      targets.push({
+        suite: sel.suite, scope: sel.scope, site: sel.site, paths: sel.paths, grep,
+      });
+    }
+  });
+  return targets;
+}
+
+/* -------------------------------- rendering -------------------------------- */
 
 function renderTree() {
   const root = $('#tree');
   root.innerHTML = '';
-  for (const site of TREE.sites) {
-    root.append(renderSiteNode(site));
+  if (!TREE || !TREE.suites.length) {
+    root.innerHTML = '<div class="empty">No suites configured. Add one to sites.config.json.</div>';
+    return;
   }
+
+  const head = el('tr', {}, ...COLUMNS.map((c) => {
+    const active = SORT.key === c.key;
+    const th = el('th', {
+      class: `col-${c.key} sortable${active ? ' sorted' : ''}`,
+      title: `Sort by ${c.label}`,
+    },
+      el('span', { class: 'th-label' }, c.label),
+      el('span', { class: 'sort-caret' }, active ? (SORT.dir === 1 ? '▲' : '▼') : '')
+    );
+    th.addEventListener('click', () => toggleSort(c.key));
+    return th;
+  }));
+
+  const table = el('table', { class: 'run-table' }, el('thead', {}, head));
+  for (const st of sortedState()) table.append(renderSuiteBody(st));
+  root.append(table);
   updateSelCount();
 }
 
-function renderSiteNode(site) {
-  const wrap = el('div', { class: 'node', 'data-site': site.key });
-  const childrenBox = el('div', { class: 'children hidden' });
-  let rendered = false;
-
-  const cb = el('input', { type: 'checkbox', 'data-issite': '1' });
-  cb.dataset.sitefilters = JSON.stringify(site.siteFilters);
-  cb.addEventListener('change', () => {
-    setSubtreeChecked(childrenBox, cb.checked);
-    updateSelCount();
-  });
-
-  const twisty = el('span', { class: 'twisty' }, '▸');
-  const dot = el('span', { class: 'site-status', title: 'reachability unknown' });
-  siteDots[site.key] = dot;
-  const label = el(
-    'span',
-    { class: 'node-label dir' },
-    el('span', { class: 'site-name' }, site.name),
-    dot,
-    ' ',
-    el('span', { class: 'count', title: countTitle(site) }, countText(site, false))
-  );
-
-  function toggle() {
-    const open = childrenBox.classList.toggle('hidden') === false;
-    twisty.textContent = open ? '▾' : '▸';
-    if (open && !rendered) {
-      rendered = true;
-      for (const child of site.children) childrenBox.append(renderNode(child, site.key));
-      // Reflect parent checkbox state onto freshly rendered children.
-      if (cb.checked) setSubtreeChecked(childrenBox, true);
-    }
+/**
+ * Framework identity chip — the "which stack is this" cue. A composite suite
+ * (one directory holding several frameworks — see config.js) has no single
+ * framework, so it wears one small chip per member instead of one badge.
+ */
+function frameworkBadge(suite) {
+  if (suite.frameworks) {
+    return el('span', { class: 'fw-cell' }, ...suite.frameworks.map((f) =>
+      el('span', { class: `fw-chip fw-${f.id}`, title: f.runner || f.id }, f.label || f.id)));
   }
-  twisty.addEventListener('click', toggle);
-  label.addEventListener('click', toggle);
-
-  wrap.append(el('div', { class: 'node-row' }, twisty, cb, label), childrenBox);
-  return wrap;
+  return el('span', { class: `fw-badge fw-${suite.framework}`, title: suite.runner || suite.framework },
+    suite.label || suite.framework);
 }
 
-function renderNode(node, siteKey) {
-  if (node.type === 'file') {
-    const cb = el('input', { type: 'checkbox', 'data-filter': node.filter });
-    cb.addEventListener('change', updateSelCount);
-    const row = el(
-      'div',
-      { class: 'node-row' },
-      el('span', { class: 'twisty' }, ''),
-      cb,
-      el('span', { class: 'node-label file' }, node.name),
-      ' ',
-      el('span', { class: 'count', title: countTitle(node) }, countText(node, true))
-    );
-    return el('div', { class: 'node' }, row);
-  }
-
-  // directory
-  const wrap = el('div', { class: 'node' });
-  const childrenBox = el('div', { class: 'children hidden' });
-  let rendered = false;
-
-  const cb = el('input', { type: 'checkbox', 'data-filter': node.filter, 'data-isdir': '1' });
-  cb.addEventListener('change', () => {
-    setSubtreeChecked(childrenBox, cb.checked);
-    updateSelCount();
-  });
-
-  const twisty = el('span', { class: 'twisty' }, '▸');
-  const label = el(
-    'span',
-    { class: 'node-label dir' },
-    node.name,
-    ' ',
-    el('span', { class: 'count', title: countTitle(node) }, countText(node, false))
-  );
-
-  function toggle() {
-    const open = childrenBox.classList.toggle('hidden') === false;
-    twisty.textContent = open ? '▾' : '▸';
-    if (open && !rendered) {
-      rendered = true;
-      for (const child of node.children) childrenBox.append(renderNode(child, siteKey));
-      if (cb.checked) setSubtreeChecked(childrenBox, true);
-    }
-  }
-  twisty.addEventListener('click', toggle);
-  label.addEventListener('click', toggle);
-
-  wrap.append(el('div', { class: 'node-row' }, twisty, cb, label), childrenBox);
-  return wrap;
+/** Badge for one tree node once it's known to be a single framework's file
+ *  or sub-tree — the per-spec-file "which stack" cue inside a composite
+ *  suite's expanded tree. `null` for a plain (single-framework) suite, whose
+ *  nodes never carry a `framework` field, and for a composite suite's mixed
+ *  directories (nodes whose descendants span more than one framework). */
+function nodeFrameworkBadge(node, suite) {
+  if (!node.framework || !suite.frameworks) return null;
+  const meta = suite.frameworks.find((f) => f.id === node.framework);
+  if (!meta) return null;
+  return el('span', { class: `fw-badge fw-${meta.id}`, title: meta.runner || meta.id },
+    el('span', { class: 'fw-name' }, meta.label || meta.id));
 }
 
-function setSubtreeChecked(box, checked) {
-  $$('input[type=checkbox]', box).forEach((c) => (c.checked = checked));
+function renderSuiteBody(st) {
+  const suite = st.suite;
+  const body = el('tbody', { class: 'suite-body', 'data-suite': st.key });
+
+  if (!suite.ok) {
+    body.append(el('tr', { class: 'suite-row broken' },
+      el('td', { class: 'col-name' }, el('span', { class: 'suite-name' }, suite.name)),
+      el('td', { class: 'col-fw' }, frameworkBadge(suite)),
+      el('td', { class: 'col-lang' }, suite.language || '—'),
+      el('td', { class: 'col-count' }, '—'),
+      el('td', { class: 'col-site', colspan: '2' },
+        el('span', { class: 'row-error' }, suite.error || 'This suite is not runnable.'))));
+    return body;
+  }
+
+  // One scope means the suite *is* the selectable row; several means the suite
+  // gets a grouping header and each scope is selected (and sited) separately.
+  const multi = st.scopes.length > 1;
+  if (multi) {
+    body.append(el('tr', { class: 'suite-row group' },
+      el('td', { class: 'col-name' }, el('span', { class: 'suite-name' }, suite.name)),
+      el('td', { class: 'col-fw' }, frameworkBadge(suite)),
+      el('td', { class: 'col-lang' }, suite.language || ''),
+      el('td', { class: 'col-count' }, countText(suite)),
+      el('td', { class: 'col-site' }),
+      el('td', { class: 'col-status' })));
+  }
+
+  if (suite.tooling && !suite.tooling.ok) {
+    body.append(el('tr', { class: 'note-row' },
+      el('td', { class: 'col-name', colspan: String(COLUMNS.length) },
+        el('span', { class: 'row-warn' }, suite.tooling.message))));
+  }
+
+  for (const sc of sortedScopes(st)) {
+    body.append(scopeRow(st, sc, !multi));
+    if (sc.open) appendChildRows(body, sc.children, 1, suite);
+  }
+  return body;
+}
+
+function scopeRow(st, sc, isSuiteRow) {
+  const suite = st.suite;
+  const hasChildren = sc.children.length > 0;
+
+  const cb = el('input', { type: 'checkbox' });
+  cb.checked = fullyChecked({ children: sc.children, node: null });
+  cb.indeterminate = partlyChecked({ children: sc.children, node: null });
+  cb.addEventListener('change', () => {
+    setScopeChecked(sc, cb.checked);
+    renderTree();
+  });
+
+  const twisty = el('span', { class: 'twisty' + (hasChildren ? '' : ' blank') },
+    hasChildren ? (sc.open ? '▾' : '▸') : '');
+  const toggle = () => { sc.open = !sc.open; renderTree(); };
+  if (hasChildren) twisty.addEventListener('click', toggle);
+
+  const name = el('span', { class: 'node-label dir' }, isSuiteRow ? suite.name : sc.scope.name);
+  if (hasChildren) name.addEventListener('click', toggle);
+
+  const row = el('tr', { class: 'scope-row' },
+    el('td', { class: 'col-name' }, el('span', { class: 'cell-name' }, twisty, cb, name)),
+    el('td', { class: 'col-fw' }, isSuiteRow ? frameworkBadge(suite) : null),
+    el('td', { class: 'col-lang' }, isSuiteRow ? (suite.language || '') : ''),
+    el('td', { class: 'col-count', title: countTitle(sc.scope) }, countText(sc.scope)),
+    el('td', { class: 'col-site' }, siteSelect(suite, sc)),
+    siteStatusCell(sc.site)
+  );
+  return row;
+}
+
+/**
+ * The "run this against…" dropdown — the whole point of the Site column.
+ * Options show the URL rather than the display name: the URL is the thing that
+ * actually differs between sites, and it's what you check against your browser.
+ */
+function siteSelect(suite, sc) {
+  const select = el('select', { class: 'site-select', title: 'Which registered site to run against' });
+  for (const site of suite.sites) {
+    select.append(el('option', { value: site.key, title: `${site.name} — ${site.url}` }, site.url));
+  }
+  if (!suite.sites.length) {
+    select.append(el('option', { value: '' }, '(no sites configured)'));
+    select.disabled = true;
+  }
+  select.value = sc.site;
+  select.addEventListener('change', () => {
+    sc.site = select.value;
+    renderTree(); // the status cell belongs to the newly chosen site
+  });
+  return select;
+}
+
+function siteStatusCell(siteKey) {
+  const s = SITE_STATUS[siteKey];
+  let cls = '';
+  let text = 'unknown';
+  if (s && s.checking) {
+    cls = 'checking';
+    text = 'checking…';
+  } else if (s) {
+    cls = s.up ? 'up' : 'down';
+    text = s.up ? `up · ${s.ms}ms` : (s.error || `HTTP ${s.status}`);
+  }
+  return el('td', { class: 'col-status' },
+    el('span', { class: `site-status ${cls}` }),
+    el('span', { class: 'status-text' }, text));
+}
+
+function appendChildRows(body, nodes, depth, suite) {
+  for (const ns of nodes) {
+    body.append(nodeRow(ns, depth, suite));
+    if (ns.node.type === 'dir' && ns.open) appendChildRows(body, ns.children, depth + 1, suite);
+  }
+}
+
+function nodeRow(ns, depth, suite) {
+  const isDir = ns.node.type === 'dir';
+
+  const cb = el('input', { type: 'checkbox' });
+  cb.checked = fullyChecked(ns);
+  cb.indeterminate = partlyChecked(ns);
+  cb.addEventListener('change', () => {
+    setChecked(ns, cb.checked);
+    renderTree();
+  });
+
+  const twisty = el('span', { class: 'twisty' + (isDir ? '' : ' blank') },
+    isDir ? (ns.open ? '▾' : '▸') : '');
+  const toggle = () => { ns.open = !ns.open; renderTree(); };
+  if (isDir) twisty.addEventListener('click', toggle);
+
+  const name = el('span', { class: `node-label ${isDir ? 'dir' : 'file'}` }, ns.node.name);
+  if (isDir) name.addEventListener('click', toggle);
+
+  // Only ever set for a composite suite (see config.js/tree.js) — the cue for
+  // which framework this file, or this whole sub-tree, belongs to.
+  const fwBadge = nodeFrameworkBadge(ns.node, suite);
+  const meta = fwBadge && suite.frameworks.find((f) => f.id === ns.node.framework);
+
+  return el('tr', { class: 'node-row' },
+    el('td', { class: 'col-name' },
+      el('span', { class: 'cell-name', style: `padding-left:${depth * 22}px` }, twisty, cb, name)),
+    el('td', { class: 'col-fw' }, fwBadge),
+    el('td', { class: 'col-lang' }, meta ? (meta.language || '') : ''),
+    el('td', { class: 'col-count', title: countTitle(ns.node) }, countText(ns.node, !isDir)),
+    el('td', { class: 'col-site' }),
+    el('td', { class: 'col-status' }));
+}
+
+/* --------------------------------- counts ---------------------------------- */
+
+/** Test count is the headline number once counts are available. */
+function countText(node, isFile) {
+  const specs = node.specCount;
+  const tests = node.testCount;
+  if (!TREE || !TREE.testCountsOk || tests == null) {
+    return `${specs} spec${specs === 1 ? '' : 's'}`;
+  }
+  if (isFile) return `${tests} test${tests === 1 ? '' : 's'}`;
+  return `${tests} tests · ${specs} spec${specs === 1 ? '' : 's'}`;
+}
+
+function countTitle(node) {
+  if (!TREE || !TREE.testCountsOk) return `${node.specCount} spec file(s)`;
+  return `${node.testCount} test(s) across ${node.specCount} spec file(s)`;
 }
 
 /** Count selected specs + tests and enable/disable the Run button. */
 function updateSelCount() {
   let count = 0;
   let tests = 0;
-  for (const siteEl of $$('#tree > .node')) {
-    const sel = collectSiteSelection(siteEl);
+  forEachScope((sc) => {
+    const sel = collectScopeSelection(sc);
     count += sel.specCount;
     tests += sel.testCount || 0;
-  }
+  });
   const showTests = TREE && TREE.testCountsOk;
   $('#selCount').textContent = showTests
     ? `${tests} test${tests === 1 ? '' : 's'} · ${count} spec${count === 1 ? '' : 's'} selected`
@@ -275,79 +637,27 @@ function updateSelCount() {
   $('#btnRun').textContent = count > 0 && showTests
     ? `Run ${tests} test${tests === 1 ? '' : 's'} ▶`
     : 'Run selected ▶';
-}
-
-/** Label helpers — test count is the headline number once counts are available. */
-function countText(node, isFile) {
-  const specs = node.specCount;
-  const tests = node.testCount;
-  if (!TREE || !TREE.testCountsOk || tests == null) return `(${specs})`;
-  if (isFile) return `(${tests} test${tests === 1 ? '' : 's'})`;
-  return `(${tests} tests · ${specs} specs)`;
-}
-function countTitle(node) {
-  if (!TREE || !TREE.testCountsOk) return `${node.specCount} spec file(s)`;
-  return `${node.testCount} test(s) across ${node.specCount} spec file(s)`;
+  updateGrepHint();
 }
 
 /**
- * For one site DOM node, return { site, paths, specCount }.
- * - If the site checkbox is checked → whole site (siteFilters).
- * - Else gather checked dir/file filters, pruning descendants of checked dirs.
+ * Not every framework can filter by keyword: Playwright has --grep and the
+ * Selenium adapter resolves a keyword into explicit Class#method selections,
+ * but Cypress has no CLI title filter at all. Say so rather than silently
+ * running more tests than asked for.
  */
-function collectSiteSelection(siteEl) {
-  const siteKey = siteEl.dataset.site;
-  const siteData = TREE.sites.find((s) => s.key === siteKey);
-  const siteCb = siteEl.querySelector('input[data-issite]');
-
-  if (siteCb && siteCb.checked) {
-    return { site: siteKey, paths: siteData.siteFilters, specCount: siteData.specCount, testCount: siteData.testCount || 0 };
-  }
-
-  // Collect checked nodes that have a filter; prune any whose ancestor is checked.
-  const checked = $$('input[data-filter]', siteEl).filter((c) => c.checked);
-  if (!checked.length) return { site: siteKey, paths: [], specCount: 0, testCount: 0 };
-
-  const filters = checked.map((c) => c.dataset.filter);
-  const pruned = filters.filter(
-    (f) => !filters.some((other) => other !== f && f.startsWith(other) && other.endsWith('/'))
-  );
-
-  // Spec + test counts: sum counts of pruned nodes (look up in tree).
-  let specCount = 0;
-  let testCount = 0;
-  for (const f of pruned) {
-    const c = countsForFilter(siteData, f);
-    specCount += c.specCount;
-    testCount += c.testCount;
-  }
-  return { site: siteKey, paths: pruned, specCount, testCount };
+function updateGrepHint() {
+  const hint = $('#grepHint');
+  if (!hint) return;
+  const grep = $('#grepInput').value.trim();
+  const ignoring = selectedSuites().filter((s) => !s.supportsGrep);
+  if (!grep || !ignoring.length) { hint.classList.add('hidden'); return; }
+  hint.textContent =
+    `Keyword filter ignored for ${[...new Set(ignoring.map((s) => s.label))].join(', ')} — ` +
+    `${ignoring[0].grepNote || 'this framework has no CLI keyword filter'}. Select specs instead.`;
+  hint.classList.remove('hidden');
 }
 
-function countsForFilter(siteData, filter) {
-  let found = { specCount: 0, testCount: 0 };
-  const walk = (nodes) => {
-    for (const n of nodes) {
-      if (n.filter === filter) { found = { specCount: n.specCount, testCount: n.testCount || 0 }; return true; }
-      if (n.children && walk(n.children)) return true;
-    }
-    return false;
-  };
-  walk(siteData.children);
-  return found;
-}
-
-function buildTargets() {
-  const grep = $('#grepInput').value.trim() || undefined;
-  const targets = [];
-  for (const siteEl of $$('#tree > .node')) {
-    const sel = collectSiteSelection(siteEl);
-    if (sel.specCount > 0) {
-      targets.push({ site: sel.site, paths: sel.paths, grep });
-    }
-  }
-  return targets;
-}
 
 /* ------------------------------- run actions ------------------------------- */
 
@@ -357,13 +667,13 @@ $('#btnRun').addEventListener('click', async () => {
   if (!targets.length) return;
 
   // Preflight the selected sites; warn (don't block) if any are unreachable.
-  const keys = targets.map((t) => t.site);
+  const keys = [...new Set(targets.map((t) => t.site))];
   const status = await checkSites(keys);
   const down = keys.filter((k) => status[k] && status[k].up === false);
   if (down.length) {
     const ok = confirm(
       `These sites look unreachable (LocalWP not running?):\n  ${down.join(', ')}\n\n` +
-        `Auth will fail for them. Start anyway?`
+        `Logging in will fail for them. Start anyway?`
     );
     if (!ok) return;
   }
@@ -385,52 +695,142 @@ $('#btnRun').addEventListener('click', async () => {
 
 $('#btnCheckSites').addEventListener('click', () => checkSites());
 
-/** Ping sites and update the tree status dots. Returns the status map. */
+/**
+ * Ping sites and refresh the Site status column. Sites are shared across suites,
+ * so one sweep covers every row pointing at the same site. Returns the status
+ * map.
+ */
 async function checkSites(keys) {
-  const targetKeys = keys && keys.length ? keys : Object.keys(siteDots);
-  targetKeys.forEach((k) => {
-    const d = siteDots[k];
-    if (d) { d.className = 'site-status checking'; d.title = 'checking…'; }
-  });
+  const wanted = keys && keys.length
+    ? keys
+    : [...new Set(STATE.flatMap((st) => st.scopes.map((sc) => sc.site)).filter(Boolean))];
+  for (const key of wanted) SITE_STATUS[key] = { checking: true };
+  if (TREE) renderTree();
+
   let status = {};
   try {
     const q = keys && keys.length ? `?sites=${keys.join(',')}` : '';
     ({ sites: status } = await api('/api/preflight' + q));
   } catch (_) {
+    for (const key of wanted) delete SITE_STATUS[key]; // don't leave rows stuck on "checking…"
+    if (TREE) renderTree();
     return {};
   }
-  for (const [k, s] of Object.entries(status)) {
-    const d = siteDots[k];
-    if (!d) continue;
-    d.className = 'site-status ' + (s.up ? 'up' : 'down');
-    d.title = s.up
-      ? `up (HTTP ${s.status}, ${s.ms}ms)`
-      : `unreachable (${s.error || 'HTTP ' + s.status})`;
-  }
+  SITE_STATUS = { ...SITE_STATUS, ...status };
+  if (TREE) renderTree();
   return status;
 }
 
-$('#btnExpandAll').addEventListener('click', () => {
-  // Children render lazily on expand, so each pass only reveals the next level.
-  // Repeat until no collapsed nodes remain (depth-bounded guard vs. infinite loop).
-  for (let pass = 0; pass < 50; pass++) {
-    let expanded = false;
-    for (const t of $$('#tree .twisty')) {
-      const box = t.parentElement.parentElement.querySelector('.children');
-      if (box && box.classList.contains('hidden')) { t.click(); expanded = true; }
+/* ---------------------------------- sites ---------------------------------- */
+
+$('#btnAddSite').addEventListener('click', () => {
+  const box = $('#siteForm');
+  if (box.classList.contains('hidden')) showSiteForm();
+  else box.classList.add('hidden');
+});
+
+async function showSiteForm() {
+  const box = $('#siteForm');
+  box.classList.remove('hidden');
+  box.innerHTML = '';
+
+  const name = el('input', { type: 'text', placeholder: 'e.g. Staging' });
+  const url = el('input', { type: 'text', placeholder: 'https://staging.example.com' });
+  const user = el('input', { type: 'text', placeholder: 'admin', value: 'admin' });
+  const pass = el('input', { type: 'password', placeholder: 'admin' });
+  const err = el('div', { class: 'error-banner hidden' });
+  const list = el('div', { class: 'sched-targets' });
+
+  const save = el('button', { class: 'primary' }, 'Add site');
+  save.addEventListener('click', async () => {
+    err.classList.add('hidden');
+    try {
+      await api('/api/sites', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name.value, url: url.value, adminUser: user.value, adminPass: pass.value }),
+      });
+      name.value = '';
+      url.value = '';
+      user.value = 'admin';
+      pass.value = '';
+      await loadTree(true);
+      await refreshCustomSiteList(list);
+    } catch (e) {
+      err.textContent = e.message;
+      err.classList.remove('hidden');
     }
-    if (!expanded) break;
-  }
-});
-$('#btnCollapseAll').addEventListener('click', () => {
-  $$('#tree > .node > .node-row > .twisty').forEach((t) => {
-    const box = t.parentElement.parentElement.querySelector('.children');
-    if (box && !box.classList.contains('hidden')) t.click();
   });
-});
+  const cancel = el('button', { class: 'ghost' }, 'Close');
+  cancel.addEventListener('click', () => box.classList.add('hidden'));
+
+  box.append(
+    el('div', { class: 'row' },
+      el('div', {}, el('label', {}, 'Name'), name),
+      el('div', {}, el('label', {}, 'URL'), url)),
+    el('div', { class: 'row' },
+      el('div', {}, el('label', {}, 'Admin username'), user),
+      el('div', {}, el('label', {}, 'Admin password'), pass)),
+    err,
+    el('div', { class: 'actions' }, save, cancel),
+    list
+  );
+
+  await refreshCustomSiteList(list);
+}
+
+/** List sites added from this panel, each removable — sites.config.json ones
+ *  aren't shown here since they can't be deleted through the UI. */
+async function refreshCustomSiteList(list) {
+  list.innerHTML = '';
+  let sites = [];
+  try {
+    ({ sites } = await api('/api/sites'));
+  } catch (_) {
+    return;
+  }
+  const custom = sites.filter((s) => s.custom);
+  if (!custom.length) return;
+  for (const s of custom) {
+    const del = el('button', { class: 'ghost' }, '🗑');
+    del.addEventListener('click', async () => {
+      if (!confirm(`Remove site "${s.name}"?`)) return;
+      try {
+        await api(`/api/sites/${s.key}`, { method: 'DELETE' });
+        await loadTree(true);
+        await refreshCustomSiteList(list);
+      } catch (e) {
+        alert(e.message);
+      }
+    });
+    list.append(el('div', { class: 'sched-target' },
+      el('span', { class: 'sched-target-name' }, s.name),
+      el('span', { class: 'site-pick-label' }, s.url),
+      el('span', { class: 'spacer' }),
+      del));
+  }
+}
+
+/** Open/close every expandable row. */
+function setAllOpen(open) {
+  const walk = (nodes) => {
+    for (const ns of nodes) {
+      if (ns.node.type === 'dir') ns.open = open;
+      walk(ns.children);
+    }
+  };
+  forEachScope((sc) => {
+    sc.open = open;
+    walk(sc.children);
+  });
+  renderTree();
+}
+
+$('#btnExpandAll').addEventListener('click', () => setAllOpen(true));
+$('#btnCollapseAll').addEventListener('click', () => setAllOpen(false));
 $('#btnClear').addEventListener('click', () => {
-  $$('#tree input[type=checkbox]').forEach((c) => (c.checked = false));
-  updateSelCount();
+  forEachScope((sc) => setScopeChecked(sc, false));
+  renderTree();
 });
 $('#btnRefreshTree').addEventListener('click', () => loadTree(true));
 
@@ -439,7 +839,9 @@ $('#btnRefreshTree').addEventListener('click', () => loadTree(true));
 let liveSource = null;
 let liveTimer = null;
 let liveRunId = null;
-const cardRefs = {}; // site -> { node, refs... }
+// Keyed by target key ("<suite>__<site>"), not by site: the same site can be
+// under test by several suites in one run.
+const cardRefs = {};
 
 async function refreshActiveList() {
   let data;
@@ -485,23 +887,23 @@ function handleLiveEvent(ev) {
       renderLive(ev.run);
       break;
     case 'target-begin':
-      setTargetTotals(ev.site, ev.totals);
+      setTargetTotals(ev.target, ev.totals);
       break;
     case 'target-update':
     case 'target-end':
       updateTargetCard(ev.target);
       break;
     case 'plan':
-      renderTargetTests(ev.site, { plannedTests: ev.tests });
+      renderTargetTests(ev.target, { plannedTests: ev.tests });
       break;
     case 'current':
-      setCurrent(ev.site, ev.title);
-      if (ev.id) setRowRunning(ev.site, ev.id);
+      setCurrent(ev.target, ev.title);
+      if (ev.id) setRowRunning(ev.target, ev.id);
       break;
     case 'test':
-      setTargetTotals(ev.site, ev.targetTotals);
+      setTargetTotals(ev.target, ev.targetTotals);
       setRunTotals(ev.runTotals);
-      if (ev.test) setRowDone(ev.site, ev.test);
+      if (ev.test) setRowDone(ev.target, ev.test);
       break;
     case 'run-end':
       renderLive(ev.run);
@@ -575,7 +977,26 @@ function totalsText(t) {
   return `✓ ${t.passed}  ✗ ${t.failed}  • ${t.skipped} skipped  —  ${t.completed}/${t.total || '?'}`;
 }
 
+/** Where a finished target's detail lives: a real report, or a file listing. */
+function targetReportLink(runId, t) {
+  const key = t.key || t.site;
+  return t.reportKind === 'artifacts'
+    ? el('a', { class: 'report-link', href: `/api/runs/${runId}/artifacts/${key}`, target: '_blank' },
+        '↗ Artifacts (screenshots, reports)')
+    : el('a', { class: 'report-link', href: `/api/runs/${runId}/report/${key}/index.html`, target: '_blank' },
+        '↗ Open Playwright report');
+}
+
+/** Compact "Cypress · TypeScript" chip for a run target. */
+function targetFrameworkBadge(t) {
+  if (!t.frameworkLabel) return null;
+  return el('span', { class: `fw-badge fw-${t.framework}` },
+    el('span', { class: 'fw-name' }, t.frameworkLabel),
+    el('span', { class: 'fw-lang' }, t.language || ''));
+}
+
 function buildCard(runId, t) {
+  const key = t.key || t.site;
   const totals = t.totals || { total: 0, passed: 0, failed: 0, skipped: 0, completed: 0 };
   const status = stBadge(t.status);
   const segPass = el('div', { class: 'seg-pass' });
@@ -592,23 +1013,28 @@ function buildCard(runId, t) {
   const toggle = el('button', { class: 'ghost expand-toggle' }, 'Show tests');
   toggle.addEventListener('click', () => {
     testList.classList.toggle('hidden');
-    updateToggleCount(t.site);
+    updateToggleCount(key);
   });
 
   const auth = t.authStatus === 'failed'
     ? el('span', { class: 'st st-error' }, 'auth failed')
     : null;
 
-  // Per-site controls: Cancel while active, Re-run once terminal.
+  // Per-target controls: Cancel while active, Re-run once terminal.
   const actions = el('div', { class: 'card-actions' });
 
   const card = el('div', { class: 'card' },
     el('div', { class: 'card-head' },
-      el('span', { class: 'name' }, t.name),
+      targetFrameworkBadge(t),
+      el('span', { class: 'name' }, t.suiteName || t.name),
       el('span', { class: 'spacer' }),
       auth,
       status
     ),
+    el('div', { class: 'card-site' },
+      el('span', { class: 'card-site-label' }, 'on'),
+      el('span', { class: 'card-site-name' }, t.siteName || t.site),
+      el('span', { class: 'card-site-url' }, t.url || '')),
     el('div', { class: 'progress' }, segPass, segFail, segSkip),
     el('div', { class: 'counts' }, cPass, cFail, cSkip, cTotal),
     current,
@@ -617,40 +1043,37 @@ function buildCard(runId, t) {
     testList
   );
 
-  cardRefs[t.site] = {
+  cardRefs[key] = {
     card, status, segPass, segFail, segSkip, cPass, cFail, cSkip, cTotal,
     current, actions, testList, toggle, totals, rows: new Map(), planned: false,
+    target: t,
   };
-  renderSiteActions(actions, runId, t);
+  renderTargetActions(actions, runId, t);
 
   // Build the full list from the snapshot (planned + finished + running).
-  renderTargetTests(t.site, t);
-  updateBars(t.site);
+  renderTargetTests(key, t);
+  updateBars(key);
 
-  // Report link only once the target is done (Playwright writes it at the end).
+  // Report link only once the target is done (it's written at the end).
   if (['passed', 'failed', 'error', 'cancelled'].includes(t.status)) {
-    card.append(el('a', {
-      class: 'report-link',
-      href: `/api/runs/${runId}/report/${t.site}/index.html`,
-      target: '_blank',
-    }, '↗ Open Playwright report'));
+    card.append(targetReportLink(runId, t));
   }
   return card;
 }
 
-function setTargetTotals(site, totals) {
-  const r = cardRefs[site];
+function setTargetTotals(key, totals) {
+  const r = cardRefs[key];
   if (!r || !totals) return;
   r.totals = totals;
   r.cPass.textContent = `✓ ${totals.passed}`;
   r.cFail.textContent = `✗ ${totals.failed}`;
   r.cSkip.textContent = `• ${totals.skipped}`;
   r.cTotal.textContent = `${totals.completed}/${totals.total || '?'}`;
-  updateBars(site);
+  updateBars(key);
 }
 
-function updateBars(site) {
-  const r = cardRefs[site];
+function updateBars(key) {
+  const r = cardRefs[key];
   if (!r) return;
   const t = r.totals;
   const total = t.total || t.completed || 1;
@@ -664,15 +1087,23 @@ function setRunTotals(totals) {
   if (h && h.totals) h.totals.textContent = totalsText(totals);
 }
 
-function setCurrent(site, title) {
-  const r = cardRefs[site];
+function setCurrent(key, title) {
+  const r = cardRefs[key];
   if (r) r.current.textContent = title || '';
 }
 
-/** Trim the "chromium › <file>.spec.ts › …" prefix down to the readable name. */
+/**
+ * Trim a test title down to the readable part. Playwright prefixes its path
+ * with the project name and spec file and joins with " › "; the Cypress and
+ * Selenium adapters join their describe/class path with " > ".
+ */
 function shortTitle(title) {
-  const parts = String(title || '').split(' › ');
-  return parts.length > 2 ? parts.slice(2).join(' › ') : title;
+  const s = String(title || '');
+  if (s.includes(' › ')) {
+    const parts = s.split(' › ');
+    return parts.length > 2 ? parts.slice(2).join(' › ') : s;
+  }
+  return s;
 }
 
 function statusGlyph(status) {
@@ -683,12 +1114,20 @@ function statusGlyph(status) {
   return ''; // running → empty (a CSS spinner shows via the .spin class)
 }
 
-function makeRowClickable(row, site, test) {
+function makeRowClickable(row, key, test) {
+  const t = (cardRefs[key] && cardRefs[key].target) || {};
   row.classList.add('clickable-row');
   row.onclick = () => openErrorModal({
     title: shortTitle(test.title), status: 'failed', durationMs: test.durationMs,
-    site, error: test.error,
-    reportUrl: liveRunId ? `/api/runs/${liveRunId}/report/${site}/index.html` : null,
+    site: t.siteName || t.site || key, error: test.error,
+    reportUrl: liveRunId
+      ? (t.reportKind === 'artifacts'
+          ? `/api/runs/${liveRunId}/artifacts/${key}`
+          : `/api/runs/${liveRunId}/report/${key}/index.html`)
+      : null,
+    reportLabel: t.reportKind === 'artifacts'
+      ? '↗ Artifacts (screenshots, reports)'
+      : '↗ Open Playwright report (trace & screenshots)',
   });
   if (!row.querySelector('.info-ic')) row.append(infoIcon());
 }
@@ -722,7 +1161,7 @@ function infoIcon() {
 }
 
 /** Build one test row for {id,title,status,durationMs}. */
-function makeRow(test, site) {
+function makeRow(test, key) {
   const status = test.status || 'pending';
   const ic = el('span', { class: 'ic' });
   setIcon(ic, status);
@@ -731,14 +1170,14 @@ function makeRow(test, site) {
     el('span', { class: 'tname', title: test.title }, shortTitle(test.title)),
     el('span', { class: 'dur' }, test.durationMs != null ? fmtDuration(test.durationMs) : '')
   );
-  if (status === 'failed') makeRowClickable(row, site, test);
+  if (status === 'failed') makeRowClickable(row, key, test);
   return row;
 }
 
 /** Update a row in place when a test starts running or finishes. */
-function applyRowStatus(row, site, test) {
+function applyRowStatus(row, key, test) {
   row.className = `test-row ${test.status}`;
-  if (test.status === 'failed') makeRowClickable(row, site, test);
+  if (test.status === 'failed') makeRowClickable(row, key, test);
   else {
     row.classList.remove('clickable-row');
     row.onclick = null;
@@ -754,8 +1193,8 @@ function applyRowStatus(row, site, test) {
  * with already-finished results and currently-running spinners applied. Falls
  * back to an append-as-they-finish list if no plan is available.
  */
-function renderTargetTests(site, target) {
-  const r = cardRefs[site];
+function renderTargetTests(key, target) {
+  const r = cardRefs[key];
   if (!r) return;
   r.testList.innerHTML = '';
   r.rows = new Map();
@@ -767,35 +1206,35 @@ function renderTargetTests(site, target) {
   for (const p of planned || target.tests || []) {
     const done = doneById.get(p.id);
     const state = done ? { ...p, ...done } : { ...p, status: running.has(p.id) ? 'running' : 'pending' };
-    const row = makeRow(state, site);
+    const row = makeRow(state, key);
     r.rows.set(p.id, row);
     r.testList.append(row);
   }
-  updateToggleCount(site);
+  updateToggleCount(key);
 }
 
-function setRowRunning(site, id) {
-  const r = cardRefs[site];
+function setRowRunning(key, id) {
+  const r = cardRefs[key];
   if (!r || !r.rows) return;
   const row = r.rows.get(id);
   if (!row) return;
-  applyRowStatus(row, site, { status: 'running' });
+  applyRowStatus(row, key, { status: 'running' });
   if (!r.testList.classList.contains('hidden')) row.scrollIntoView({ block: 'nearest' });
-  updateToggleCount(site);
+  updateToggleCount(key);
 }
 
-function setRowDone(site, test) {
-  const r = cardRefs[site];
+function setRowDone(key, test) {
+  const r = cardRefs[key];
   if (!r) return;
   if (!r.rows) r.rows = new Map();
   const row = r.rows.get(test.id);
-  if (row) applyRowStatus(row, site, test);
-  else { const nr = makeRow(test, site); r.rows.set(test.id, nr); r.testList.append(nr); } // fallback (no plan)
-  updateToggleCount(site);
+  if (row) applyRowStatus(row, key, test);
+  else { const nr = makeRow(test, key); r.rows.set(test.id, nr); r.testList.append(nr); } // fallback (no plan)
+  updateToggleCount(key);
 }
 
-function updateToggleCount(site) {
-  const r = cardRefs[site];
+function updateToggleCount(key) {
+  const r = cardRefs[key];
   if (!r || !r.toggle) return;
   const total = r.planned ? r.rows.size : (r.totals && r.totals.total) || r.rows.size;
   let done = 0;
@@ -831,7 +1270,7 @@ function ensureModal() {
   return _modal;
 }
 
-function openErrorModal({ title, status, durationMs, site, error, reportUrl }) {
+function openErrorModal({ title, status, durationMs, site, error, reportUrl, reportLabel }) {
   const m = ensureModal();
   m.titleEl.textContent = title || 'Test failure';
   m.metaEl.innerHTML = '';
@@ -842,28 +1281,26 @@ function openErrorModal({ title, status, durationMs, site, error, reportUrl }) {
   m.footer.innerHTML = '';
   if (reportUrl) {
     m.footer.append(el('a', { class: 'report-link', href: reportUrl, target: '_blank' },
-      '↗ Open Playwright report (trace & screenshots)'));
+      reportLabel || '↗ Open report'));
   }
   m.overlay.classList.remove('hidden');
 }
 
 function updateTargetCard(t) {
-  const r = cardRefs[t.site];
+  const key = t.key || t.site;
+  const r = cardRefs[key];
   if (!r) return;
+  r.target = { ...r.target, ...t };
   const nb = stBadge(t.status);
   r.status.replaceWith(nb);
   r.status = nb; // keep a direct handle (avoids grabbing the auth badge)
-  if (t.totals) setTargetTotals(t.site, t.totals);
-  if (t.currentTest !== undefined) setCurrent(t.site, t.currentTest);
-  // Flip the per-site action button (Cancel ↔ Re-run) on status change.
-  if (r.actions) renderSiteActions(r.actions, liveRunId, t);
+  if (t.totals) setTargetTotals(key, t.totals);
+  if (t.currentTest !== undefined) setCurrent(key, t.currentTest);
+  // Flip the per-target action button (Cancel ↔ Re-run) on status change.
+  if (r.actions) renderTargetActions(r.actions, liveRunId, t);
   // Add the report link as soon as this target finishes, if not already there.
   if (['passed', 'failed', 'error', 'cancelled'].includes(t.status) && !r.card.querySelector('.report-link') && liveRunId) {
-    r.card.append(el('a', {
-      class: 'report-link',
-      href: `/api/runs/${liveRunId}/report/${t.site}/index.html`,
-      target: '_blank',
-    }, '↗ Open Playwright report'));
+    r.card.append(targetReportLink(liveRunId, t));
   }
 }
 
@@ -871,9 +1308,9 @@ async function cancelRun(id) {
   try { await api(`/api/runs/${id}/cancel`, { method: 'POST' }); } catch (_) {}
 }
 
-// Render the per-site action button into `box` based on the target's status:
+// Render the per-target action button into `box` based on the target's status:
 // a Cancel button while it's active, a Re-run button once it's terminal.
-function renderSiteActions(box, runId, t) {
+function renderTargetActions(box, runId, t) {
   if (!box) return;
   box.innerHTML = '';
   if (!runId) return;
@@ -881,37 +1318,42 @@ function renderSiteActions(box, runId, t) {
   if (active) {
     box.append(el('button', {
       class: 'danger sm',
-      title: 'Stop just this site (the rest of the run keeps going)',
-      onclick: () => cancelSite(runId, t.site),
-    }, '■ Cancel site'));
+      title: 'Stop just this suite + site (the rest of the run keeps going)',
+      onclick: () => cancelTarget(runId, t.key || t.site),
+    }, '■ Cancel'));
   } else if (!t.custom) {
     box.append(el('button', {
       class: 'ghost sm',
-      title: 'Start a fresh run for just this site',
-      onclick: () => rerunSite(t.site, t.paths, t.grep),
-    }, '↻ Re-run site'));
+      title: 'Start a fresh run for just this suite + site',
+      onclick: () => rerunTarget(t),
+    }, '↻ Re-run'));
   }
 }
 
-// Cancel one site within a run (kills just its process; frees it immediately).
-async function cancelSite(runId, site) {
-  try { await api(`/api/runs/${runId}/targets/${site}/cancel`, { method: 'POST' }); }
+// Cancel one target within a run (kills just its process; frees it immediately).
+async function cancelTarget(runId, key) {
+  try { await api(`/api/runs/${runId}/targets/${key}/cancel`, { method: 'POST' }); }
   catch (_) { /* the target-end event will reflect the result */ }
 }
 
-// Start a brand-new run for a single site (the site is already free, so the
-// busy guard passes even while the original run is still going).
-async function rerunSite(site, paths, grep) {
+// Start a brand-new run for a single target (it's already free, so the busy
+// guard passes even while the original run is still going).
+async function rerunTarget(t) {
   try {
     const { id } = await api('/api/runs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ targets: [{ site, paths, grep: grep || undefined }] }),
+      body: JSON.stringify({
+        targets: [{
+          suite: t.suite, scope: t.scope || undefined, site: t.site,
+          paths: t.paths, grep: t.grep || undefined,
+        }],
+      }),
     });
     openLive(id);
     showTab('live');
   } catch (e) {
-    alert('Could not re-run ' + site + ': ' + (e.message || e));
+    alert('Could not re-run ' + (t.siteName || t.site) + ': ' + (e.message || e));
   }
 }
 
@@ -932,10 +1374,21 @@ async function loadHistory() {
 }
 
 function populateSiteFilter() {
-  const sel = $('#hSite');
-  if (!TREE || sel.options.length > 1) return;
-  for (const s of TREE.sites) {
-    sel.append(el('option', { value: s.key }, s.name));
+  if (!TREE) return;
+  const siteSel = $('#hSite');
+  if (siteSel.options.length <= 1) {
+    for (const s of TREE.sites) siteSel.append(el('option', { value: s.key }, s.name));
+  }
+  const fwSel = $('#hFramework');
+  if (fwSel && fwSel.options.length <= 1) {
+    const seen = new Set();
+    const members = TREE.suites.flatMap((s) => s.frameworks || (s.framework ? [s] : []));
+    for (const m of members) {
+      const id = m.id || m.framework;
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      fwSel.append(el('option', { value: id }, `${m.label} (${m.language})`));
+    }
   }
 }
 
@@ -943,11 +1396,15 @@ function applyHistoryFilter() {
   const q = $('#hSearch').value.trim().toLowerCase();
   const status = $('#hStatus').value;
   const site = $('#hSite').value;
+  const framework = $('#hFramework') ? $('#hFramework').value : '';
   const filtered = HISTORY.filter((r) => {
     if (status && r.status !== status) return false;
     if (site && !(r.targets || []).some((t) => t.site === site)) return false;
+    if (framework && !(r.targets || []).some((t) => t.framework === framework)) return false;
     if (q) {
-      const hay = (r.label + ' ' + (r.targets || []).map((t) => t.site).join(' ')).toLowerCase();
+      const hay = (r.label + ' ' + (r.targets || [])
+        .map((t) => `${t.site} ${t.siteName || ''} ${t.suiteName || ''} ${t.frameworkLabel || ''}`)
+        .join(' ')).toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
@@ -959,6 +1416,7 @@ function applyHistoryFilter() {
 $('#hSearch').addEventListener('input', applyHistoryFilter);
 $('#hStatus').addEventListener('change', applyHistoryFilter);
 $('#hSite').addEventListener('change', applyHistoryFilter);
+if ($('#hFramework')) $('#hFramework').addEventListener('change', applyHistoryFilter);
 
 async function loadHistorySilently() {
   if (!$('#tab-history').classList.contains('active')) return;
@@ -970,15 +1428,20 @@ function renderHistory(runs) {
   if (!runs.length) { box.innerHTML = '<div class="empty">No runs yet.</div>'; return; }
   const table = el('table', {},
     el('thead', {}, el('tr', {},
-      el('th', {}, 'When'), el('th', {}, 'Run'), el('th', {}, 'Status'),
+      el('th', {}, 'When'), el('th', {}, 'Run'), el('th', {}, 'Frameworks'), el('th', {}, 'Status'),
       el('th', {}, 'Results'), el('th', {}, 'Fail rate'), el('th', {}, 'Duration'), el('th', {}, '')
     ))
   );
   const tbody = el('tbody');
   for (const r of runs) {
+    const seen = new Set();
+    const chips = (r.targets || [])
+      .filter((t) => t.framework && !seen.has(t.framework) && seen.add(t.framework))
+      .map((t) => el('span', { class: `fw-chip fw-${t.framework}` }, t.frameworkLabel || t.framework));
     const tr = el('tr', { class: 'clickable', onclick: () => openDetail(r.id) },
       el('td', {}, fmtTime(r.startedAt || r.createdAt)),
       el('td', {}, r.label),
+      el('td', { class: 'fw-cell' }, chips.length ? chips : '—'),
       el('td', {}, runStatusBadge(r)),
       el('td', { class: 'mini-counts', html:
         `<span class="c-pass" style="color:var(--green)">✓ ${r.totals.passed}</span>` +
@@ -1038,29 +1501,37 @@ function renderDetail(run) {
     const totals = t.totals || {};
     grid.append(el('div', { class: 'card' },
       el('div', { class: 'card-head' },
-        el('span', { class: 'name' }, t.name),
+        targetFrameworkBadge(t),
+        el('span', { class: 'name' }, t.suiteName || t.name),
         el('span', { class: 'spacer' }),
         t.authStatus === 'failed' ? el('span', { class: 'st st-error' }, 'auth failed') : null,
         runStatusBadge(t)
       ),
+      el('div', { class: 'card-site' },
+        el('span', { class: 'card-site-label' }, 'on'),
+        el('span', { class: 'card-site-name' }, t.siteName || t.site),
+        el('span', { class: 'card-site-url' }, t.url || '')),
       el('div', { class: 'counts' },
         el('span', { class: 'c-pass' }, `✓ ${totals.passed || 0}`),
         el('span', { class: 'c-fail' }, `✗ ${totals.failed || 0}`),
         el('span', { class: 'c-skip' }, `• ${totals.skipped || 0}`),
         el('span', { class: 'c-total' }, `${totals.completed || 0}/${totals.total || 0}`)
       ),
-      el('a', {
-        class: 'report-link',
-        href: `/api/runs/${run.id}/report/${t.site}/index.html`,
-        target: '_blank',
-      }, '↗ Open Playwright report')
+      targetReportLink(run.id, t)
     ));
   }
   box.append(grid);
 
   // Combined, filterable test list.
   const allTests = run.targets.flatMap((t) =>
-    (t.tests || []).map((x) => ({ ...x, site: t.site, siteName: t.name }))
+    (t.tests || []).map((x) => ({
+      ...x,
+      targetKey: t.key || t.site,
+      site: t.site,
+      siteName: t.siteName || t.name,
+      frameworkLabel: t.frameworkLabel,
+      reportKind: t.reportKind,
+    }))
   );
   if (!allTests.length) return;
 
@@ -1098,9 +1569,10 @@ function renderDetail(run) {
     if (!rows.length) { listBox.append(el('div', { class: 'empty' }, 'No matching tests.')); return; }
     for (const t of rows) {
       const ic = t.status === 'passed' ? '✓' : t.status === 'failed' ? '✗' : '•';
+      const tag = t.frameworkLabel ? `${t.frameworkLabel} → ${t.siteName}` : t.site;
       const row = el('div', { class: `test-row ${t.status}` },
         el('span', { class: 'ic' }, ic),
-        el('span', { class: 'tname', title: t.title }, `[${t.site}] ${shortTitle(t.title)}`),
+        el('span', { class: 'tname', title: t.title }, `[${tag}] ${shortTitle(t.title)}`),
         el('span', { class: 'dur' }, fmtDuration(t.durationMs))
       );
       if (t.status === 'failed') {
@@ -1109,9 +1581,14 @@ function renderDetail(run) {
           title: shortTitle(t.title),
           status: t.status,
           durationMs: t.durationMs,
-          site: t.site,
+          site: tag,
           error: t.error,
-          reportUrl: `/api/runs/${run.id}/report/${t.site}/index.html`,
+          reportUrl: t.reportKind === 'artifacts'
+            ? `/api/runs/${run.id}/artifacts/${t.targetKey}`
+            : `/api/runs/${run.id}/report/${t.targetKey}/index.html`,
+          reportLabel: t.reportKind === 'artifacts'
+            ? '↗ Artifacts (screenshots, reports)'
+            : '↗ Open Playwright report (trace & screenshots)',
         }));
         row.append(infoIcon());
       }
@@ -1248,12 +1725,18 @@ function renderSchedules(schedules) {
   box.innerHTML = '';
   if (!schedules.length) { box.append(el('div', { class: 'empty' }, 'No schedules yet.')); return; }
   for (const s of schedules) {
-    const sites = s.targets.map((t) => t.site).join(', ');
+    const what = s.targets
+      .map((t) => {
+        const suite = TREE && suiteOf(t.suite);
+        const site = TREE && TREE.sites.find((x) => x.key === t.site);
+        return `${suite ? suite.label : t.suite || '?'} → ${site ? site.name : t.site}`;
+      })
+      .join(', ');
     const grep = s.targets[0] && s.targets[0].grep ? ` · grep: ${s.targets[0].grep}` : '';
     box.append(el('div', { class: 'sched-card' },
       el('div', {},
         el('div', { class: 'sname' }, s.name),
-        el('div', { class: 'meta' }, `cron: ${s.cron} · sites: ${sites}${grep}`)
+        el('div', { class: 'meta' }, `cron: ${s.cron} · ${what}${grep}`)
       ),
       el('span', { class: 'spacer' }),
       el('div', { class: 'meta' },
@@ -1308,9 +1791,30 @@ function showScheduleForm() {
   const grep = el('input', { type: 'text', placeholder: 'optional --grep keyword' });
   const preview = el('div', { class: 'cron-preview' });
 
-  const siteChecks = el('div', { class: 'site-checks' });
-  for (const s of TREE.sites) {
-    siteChecks.append(el('label', {}, el('input', { type: 'checkbox', value: s.key }), s.name));
+  // One row per selectable scope: tick it, then choose which site it runs on —
+  // the same (suite, site) pairing the Run tab uses.
+  const siteChecks = el('div', { class: 'sched-targets' });
+  for (const suite of TREE.suites) {
+    if (!suite.ok) continue;
+    for (const scope of suite.scopes) {
+      const cb = el('input', { type: 'checkbox' });
+      const select = el('select', { class: 'site-select' });
+      for (const site of suite.sites) {
+        select.append(el('option', { value: site.key }, site.name));
+      }
+      select.value = scope.defaultSite || (suite.sites[0] && suite.sites[0].key) || '';
+      const row = el('label', { class: 'sched-target' },
+        cb,
+        frameworkBadge(suite),
+        el('span', { class: 'sched-target-name' },
+          suite.scopes.length > 1 ? `${suite.name} · ${scope.name}` : suite.name),
+        el('span', { class: 'spacer' }),
+        el('span', { class: 'site-pick-label' }, 'on'),
+        select);
+      row.dataset.suite = suite.key;
+      row.dataset.scope = scope.key;
+      siteChecks.append(row);
+    }
   }
 
   const dowWrap = el('div', {}, el('label', {}, 'Day of week'), dow);
@@ -1339,8 +1843,8 @@ function showScheduleForm() {
       timeWrap, dowWrap),
     customWrap,
     preview,
-    el('div', {}, el('label', {}, 'Sites'), siteChecks),
-    el('div', {}, el('label', {}, 'Keyword filter (applies to all sites)'), grep),
+    el('div', {}, el('label', {}, 'What to run'), siteChecks),
+    el('div', {}, el('label', {}, 'Keyword filter (applies to all targets)'), grep),
     el('div', { class: 'actions' },
       el('button', { class: 'primary', onclick: save }, 'Create schedule'),
       el('button', { class: 'ghost', onclick: () => box.classList.add('hidden') }, 'Cancel'))
@@ -1348,11 +1852,16 @@ function showScheduleForm() {
   updateForm();
 
   async function save() {
-    const sites = $$('input:checked', siteChecks).map((c) => c.value);
+    const rows = $$('.sched-target', siteChecks).filter((r) => r.querySelector('input').checked);
     if (!name.value.trim()) return alert('Name is required.');
-    if (!sites.length) return alert('Pick at least one site.');
+    if (!rows.length) return alert('Pick at least one suite to run.');
     const g = grep.value.trim() || undefined;
-    const targets = sites.map((site) => ({ site, grep: g }));
+    const targets = rows.map((r) => ({
+      suite: r.dataset.suite,
+      scope: r.dataset.scope || undefined,
+      site: r.querySelector('select').value,
+      grep: g,
+    }));
     try {
       await api('/api/schedules', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1373,7 +1882,8 @@ let prbActiveId = null;
 
 async function loadPrBuilder() {
   bindPrb();
-  if (!TREE) await loadTree(); // need the site list for the test-area checkboxes
+  if (!TREE) await loadTree(); // need the suite list for the pickers below
+  renderPrbSuites();
   renderPrbAreas();
   updatePrbTestScope();
   await prbLoadProjects(); // also loads that project's PRs
@@ -1392,14 +1902,46 @@ function bindPrb() {
   $('#prbClearLog').addEventListener('click', () => { $('#prbLog').textContent = ''; });
   $$('input[name="prbTestScope"]').forEach((r) => r.addEventListener('change', updatePrbTestScope));
   $('#prbRunTests').addEventListener('click', prbRunTests);
+  if ($('#prbSuite')) {
+    $('#prbSuite').addEventListener('change', () => { renderPrbAreas(); updatePrbTestScope(); });
+  }
 }
 
 /* ---- Run tests on the PR-built site ---- */
+
+/** The suite the PR Builder will run against the built site. */
+function prbSuite() {
+  const sel = $('#prbSuite');
+  return (TREE && suiteOf(sel && sel.value)) || (TREE && TREE.suites[0]) || null;
+}
+
+function renderPrbSuites() {
+  const sel = $('#prbSuite');
+  if (!sel || !TREE) return;
+  const previous = sel.value;
+  sel.innerHTML = '';
+  for (const s of TREE.suites) {
+    if (!s.ok) continue;
+    sel.append(el('option', { value: s.key }, `${s.name} — ${s.label} (${s.language})`));
+  }
+  if (previous) sel.value = previous;
+}
+
+/**
+ * A suite's named scopes, when it has any. A suite that isn't split has nothing
+ * to pick, so the "specific areas" option is hidden for it.
+ */
 function renderPrbAreas() {
   const box = $('#prbAreas');
-  if (!box || !TREE || !TREE.sites) return;
+  if (!box || !TREE) return;
+  const suite = prbSuite();
   box.innerHTML = '';
-  for (const s of TREE.sites) {
+  const scopes = (suite && suite.scopes) || [];
+  const splittable = scopes.length > 1;
+  const areaRadio = $$('input[name="prbTestScope"]').find((r) => r.value === 'areas');
+  if (areaRadio) areaRadio.closest('label').classList.toggle('hidden', !splittable);
+  if (!splittable) return;
+  for (const s of scopes) {
     const count = TREE.testCountsOk ? ` (${s.testCount})` : '';
     box.append(el('label', { class: 'prb-area' },
       el('input', { type: 'checkbox', value: s.key }), `${s.name}${count}`));
@@ -1422,7 +1964,8 @@ async function prbRunTests() {
   const scope = prbTestScope();
   const project = currentProject();
   const grep = $('#prbTestGrep').value.trim() || undefined;
-  const body = { grep, project: project ? project.key : undefined };
+  const suite = prbSuite();
+  const body = { grep, project: project ? project.key : undefined, suite: suite ? suite.key : undefined };
   if (scope === 'all') {
     body.all = true;
   } else if (scope === 'areas') {
@@ -1684,9 +2227,17 @@ async function prbLoadHistory() {
 async function init() {
   try {
     const env = await api('/api/env');
-    $('#envInfo').textContent = env.playwrightCliExists
-      ? `suite: …${env.suiteDir.slice(-40)}`
-      : '⚠ Playwright not found — check suite path';
+    const bad = env.suites.filter((s) => !s.ok);
+    const info = $('#envInfo');
+    info.innerHTML = '';
+    info.title = env.suites.map((s) => `${s.name} (${s.label || s.framework}) — ${s.dir}`).join('\n');
+    if (bad.length) {
+      info.append(el('span', { class: 'env-bad', title: bad.map((s) => `${s.key}: ${s.reason}`).join('\n') },
+        `⚠ ${bad.length} suite${bad.length === 1 ? '' : 's'} unavailable`));
+    }
+    info.append(el('span', {},
+      `${env.suites.length - bad.length} suite${env.suites.length - bad.length === 1 ? '' : 's'} · ` +
+      `${env.sites.length} site${env.sites.length === 1 ? '' : 's'}`));
   } catch (_) {}
   await loadTree();
   checkSites(); // initial reachability sweep

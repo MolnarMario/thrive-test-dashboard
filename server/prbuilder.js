@@ -23,7 +23,7 @@ const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const { EventEmitter } = require('events');
 
-const { PR_BUILDER, SITES } = require('../config');
+const { PR_BUILDER, SUITES, DEFAULT_SUITE } = require('../config');
 const localenv = require('./localenv');
 const PJ = require('./pr-projects');
 
@@ -302,44 +302,59 @@ async function listPRs({ project: projectKey, limit, state = 'open' } = {}) {
 /* ------------------------- run tests on the built site -------------------- */
 
 /**
- * Resolve a "run the suite against the PR-built site" request into an
- * orchestrator custom target (single-site mode: PLAYWRIGHT_BASE_URL + admin
- * creds, no TEST_SITE). Scope:
- *   - all: true        → every test (`tests/`)
- *   - areas: [siteKey] → explicit test areas (config.SITES keys)
- *   - (neither)        → the project's configured testAreas
- *   - grep: string     → keyword filter (e.g. a bug number)
+ * Resolve a "run a suite against the PR-built site" request into an
+ * orchestrator custom target — one that carries its own baseUrl instead of
+ * naming a registered site, because the PR-built Local site isn't in the config.
+ *
+ * Scope:
+ *   - all: true         → every test in the suite
+ *   - areas: [scopeKey] → named scopes of the chosen suite
+ *   - (neither)         → the project's configured testAreas
+ *   - grep: string      → keyword filter (frameworks that support one)
+ *
  * Returns { target, label } for orchestrator.startRun([target], label).
  */
-function buildTestTarget({ project: projectKey, all = false, areas = [], grep } = {}) {
+function buildTestTarget({ project: projectKey, suite: suiteKey, all = false, areas = [], grep } = {}) {
   const project = PJ.getProject(projectKey);
   const site = localenv.getLocalSite(project.site);
 
-  let paths;
-  let scopeLabel;
-  if (all) {
-    paths = ['tests/'];
-    scopeLabel = 'all tests';
-  } else {
-    const areaSet = new Set();
-    for (const a of areas) if (SITES[a]) areaSet.add(a);
-    if (!areaSet.size) for (const a of project.testAreas) if (SITES[a]) areaSet.add(a);
-    if (!areaSet.size) {
-      throw new Error(
-        `No test areas resolved for "${project.name}". Set "testAreas" in ` +
-          `pr-builder.config.json (keys from your sites config), pick areas ` +
-          `explicitly, or choose "all tests".`
-      );
-    }
-    paths = [];
-    for (const a of areaSet) for (const d of SITES[a].testDirs) paths.push(`tests/${d}/`);
-    scopeLabel = [...areaSet].map((a) => SITES[a].name).join(', ');
+  const suite = SUITES[suiteKey || project.suite || DEFAULT_SUITE];
+  if (!suite) {
+    throw new Error(
+      `No test suite configured to run against the PR build. Add one to ` +
+        `sites.config.json, or set "suite" on the project in pr-builder.config.json.`
+    );
   }
 
-  const label = `🧪 ${project.name} · ${scopeLabel}` + (grep ? ` · grep:${grep}` : '');
+  let paths;
+  let scopeLabel;
+  if (all || !suite.scopes.length) {
+    paths = [''];
+    scopeLabel = 'all tests';
+  } else {
+    const byKey = new Map(suite.scopes.map((s) => [s.key, s]));
+    const wanted = (areas.length ? areas : project.testAreas || []).filter((a) => byKey.has(a));
+    if (!wanted.length) {
+      throw new Error(
+        `No test areas resolved for "${project.name}". Set "testAreas" in ` +
+          `pr-builder.config.json (scope keys from suite "${suite.key}"), pick ` +
+          `areas explicitly, or choose "all tests".`
+      );
+    }
+    paths = wanted.flatMap((a) =>
+      byKey.get(a).dirs.map((d) => (!d || d === '.' ? '' : d.replace(/\\/g, '/').replace(/\/?$/, '/')))
+    );
+    scopeLabel = wanted.map((a) => byKey.get(a).name).join(', ');
+  }
+
+  const fwLabel = suite.framework || (suite.frameworks || []).map((f) => f.id).join('+');
+  const label =
+    `🧪 ${project.name} · ${suite.name} (${fwLabel}) · ${scopeLabel}` +
+    (grep ? ` · grep:${grep}` : '');
   const target = {
-    // Namespaced so the orchestrator's per-site busy guard is per project and
-    // two projects never block each other.
+    suite: suite.key,
+    // Namespaced so the orchestrator's busy guard is per project and two
+    // projects never block each other.
     site: `pr:${project.key}`,
     name: `${project.name} (PR build)`,
     url: site.url,

@@ -1,21 +1,80 @@
 {
-  "_comment": "Copy to sites.config.json and edit. `suiteDir` is optional and resolved relative to the dashboard root; omit it to auto-detect a Playwright suite next to the dashboard. Use testDirs: [\".\"] when specs sit directly in the tests root rather than in per-site subfolders.",
-  "suiteDir": "../automated-tests",
+  "//": [
+    "Copy this file to sites.config.json and edit it.",
+    "",
+    "Two independent lists; the run matrix is their product.",
+    "",
+    "  sites  — WHERE tests run. A URL plus the admin credentials to use.",
+    "           Every suite is handed these as E2E_BASE_URL / E2E_ADMIN_USER /",
+    "           E2E_ADMIN_PASS, so a suite that reads those can be pointed at",
+    "           any registered site from the dashboard's dropdown.",
+    "",
+    "  suites — HOW tests run. A directory plus which framework it uses:",
+    "           'playwright' (*.spec.ts), 'cypress' (*.cy.ts) or",
+    "           'selenium' (Java, *Test.java via Maven Surefire).",
+    "           Omit 'framework' to auto-detect from the files on disk.",
+    "",
+    "Optional per-suite keys:",
+    "  sites        — restrict which sites this suite may target (default: all)",
+    "  defaultSite  — the site preselected in the dropdown",
+    "  env          — extra environment variables for this suite's runs",
+    "  scopes       — split one suite into separately selectable slices, each",
+    "                 with its own default site (for a suite whose specs are",
+    "                 organised per product/tenant). See the example below."
+  ],
+
   "sites": {
     "site-a": {
       "name": "Site A",
       "url": "https://site-a.local",
-      "testDirs": ["site-a"]
+      "adminUser": "admin",
+      "adminPass": "admin"
     },
     "site-b": {
       "name": "Site B",
       "url": "https://site-b.local",
-      "testDirs": ["site-b"]
+      "adminUser": "admin",
+      "adminPass": "admin"
     },
-    "main": {
-      "name": "Main (cross-site)",
-      "url": "https://main.local",
-      "testDirs": ["cross-site"]
+    "staging": {
+      "name": "Staging",
+      "url": "https://staging.example.com",
+      "adminUser": "admin",
+      "adminPass": "change-me"
+    }
+  },
+
+  "suites": {
+    "e2e-playwright": {
+      "name": "End-to-end",
+      "framework": "playwright",
+      "dir": "../my-project/e2e-playwright",
+      "defaultSite": "site-a"
+    },
+
+    "e2e-cypress": {
+      "name": "End-to-end",
+      "framework": "cypress",
+      "dir": "../my-project/e2e-cypress",
+      "defaultSite": "site-b"
+    },
+
+    "e2e-selenium": {
+      "name": "End-to-end",
+      "framework": "selenium",
+      "dir": "../my-project/e2e-selenium",
+      "sites": ["site-a", "staging"],
+      "defaultSite": "site-a"
+    },
+
+    "//multi-tenant-example": {
+      "name": "Legacy suite split per product",
+      "framework": "playwright",
+      "dir": "../my-project/automated-tests",
+      "scopes": {
+        "site-a": { "name": "Site A tests", "dirs": ["site-a"], "defaultSite": "site-a" },
+        "site-b": { "name": "Site B tests", "dirs": ["site-b"], "defaultSite": "site-b" }
+      }
     }
   }
 }

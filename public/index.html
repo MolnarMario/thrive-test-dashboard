@@ -17,7 +17,7 @@
         </span>
         <span class="brand-text">
           <span class="brand-title">Automation Test Platform</span>
-          <span class="brand-sub">runner · history · PR builder</span>
+          <span class="brand-sub">Playwright · Cypress · Selenium</span>
         </span>
       </div>
       <nav class="tabs">
@@ -41,13 +41,16 @@
             <button id="btnClear" class="ghost">Clear selection</button>
             <button id="btnRefreshTree" class="ghost" title="Rescan suite for specs">↻ Rescan</button>
             <button id="btnCheckSites" class="ghost" title="Ping LocalWP sites">◎ Check sites</button>
+            <button id="btnAddSite" class="ghost">+ Add site</button>
           </div>
           <div class="right">
-            <input id="grepInput" type="text" placeholder="Filter by keyword (--grep), optional" />
+            <input id="grepInput" type="text" placeholder="Filter by keyword, optional" />
             <span id="selCount" class="sel-count">0 specs selected</span>
             <button id="btnRun" class="primary" disabled>Run selected ▶</button>
           </div>
         </div>
+        <div id="siteForm" class="sched-form hidden"></div>
+        <div id="grepHint" class="warn-banner hidden"></div>
         <div id="runError" class="error-banner hidden"></div>
         <div id="tree" class="tree">Loading test tree…</div>
       </section>
@@ -73,6 +76,7 @@
             <option value="running">Running</option>
           </select>
           <select id="hSite"><option value="">All sites</option></select>
+          <select id="hFramework"><option value="">All frameworks</option></select>
           <span id="hCount" class="sel-count"></span>
         </div>
         <div id="historyList" class="history-list">Loading…</div>
@@ -151,8 +155,10 @@
 
         <div class="prb-runtests">
           <h3>Run tests on <code id="prbTestSite">…</code></h3>
-          <p class="muted-note">Runs the suite against the PR-built site (single-site mode). The site must be running in Local. Results appear in <b>Live</b> and <b>History</b>.</p>
+          <p class="muted-note">Runs a suite against the PR-built site. The site must be running in Local. Results appear in <b>Live</b> and <b>History</b>.</p>
           <div id="prbTestError" class="error-banner hidden"></div>
+          <label>Suite</label>
+          <select id="prbSuite"></select>
           <div class="prb-test-scope">
             <label class="prb-radio"><input type="radio" name="prbTestScope" value="project" checked /> Project's tests <span id="prbBuiltInfo" class="muted"></span></label>
             <label class="prb-radio"><input type="radio" name="prbTestScope" value="areas" /> Specific areas…</label>

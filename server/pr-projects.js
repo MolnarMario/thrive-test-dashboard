@@ -174,7 +174,7 @@ function defaultVersion({ prNumber } = {}) {
 
 /* ---------------------------------- tests --------------------------------- */
 
-/** Test-suite areas (keys into config.SITES) to run for a project. */
+/** Test-suite areas (scope keys of the project's suite) to run for a project. */
 function testAreasFor(key) {
   return getProject(key).testAreas;
 }
