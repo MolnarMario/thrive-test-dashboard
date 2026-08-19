@@ -354,7 +354,7 @@ async function executeRun(id) {
  */
 async function launchWithStagger(id, targets) {
   const run = active.get(id);
-  const inflight = []; // { done:boolean, promise:Promise }
+  const inflight = []; // { done:boolean, promise:Promise, site:string }
 
   for (let i = 0; i < targets.length; i++) {
     if (run.cancelled) break;
@@ -369,14 +369,30 @@ async function launchWithStagger(id, targets) {
       }
     }
     if (run.cancelled) break;
-    if (target.cancelled) continue; // cancelled during the cap-wait
 
-    const rec = { done: false };
+    // Targets against the same site share live state (e.g. a WordPress
+    // install's DB/options) even when they're different frameworks — a
+    // composite suite like e2e-combo resolves into one target per framework,
+    // all against the same site. Running those concurrently lets one
+    // framework's setting change or page read land mid-way through another's,
+    // producing nondeterministic failures. Never run two targets against the
+    // same site at once, regardless of MAX_CONCURRENT_SITES.
+    while (inflight.some((p) => !p.done && p.site === target.site)) {
+      await Promise.race(inflight.filter((p) => !p.done).map((p) => p.promise));
+      if (run.cancelled) break;
+    }
+    if (run.cancelled) break;
+    if (target.cancelled) continue; // cancelled during the cap/site wait
+
+    const rec = { done: false, site: target.site };
     rec.promise = runTests(id, target).then(() => { rec.done = true; });
     inflight.push(rec);
 
-    // Stagger before the NEXT launch (no wait after the last one).
-    if (i < targets.length - 1 && SITE_START_STAGGER_MS > 0) {
+    // Stagger before the NEXT launch, but only when it's a different site —
+    // same-site targets already wait for each other above, so an extra flat
+    // delay there would just slow the run down for no reason.
+    const next = targets[i + 1];
+    if (next && next.site !== target.site && SITE_START_STAGGER_MS > 0) {
       await cancellableDelay(id, SITE_START_STAGGER_MS);
     }
   }
