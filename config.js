@@ -360,6 +360,31 @@ function addSite({ name, url, adminUser, adminPass } = {}) {
   return SITES[key];
 }
 
+/** Update a site previously added via addSite(). Config-file sites can't be
+ *  edited here by design — sites.config.json stays the source of truth for
+ *  anything checked into a team's local setup. Password is optional on
+ *  update: an empty/omitted value keeps the existing one. */
+function updateSite(key, { name, url, adminUser, adminPass } = {}) {
+  const custom = readCustomSites();
+  const entry = custom.find((c) => c.key === key);
+  if (!entry) throw new Error('Only sites added through the dashboard can be edited here.');
+
+  const cleanName = String(name || '').trim();
+  if (!cleanName) throw new Error('Name is required.');
+  const cleanUrl = String(url || '').trim().replace(/\/$/, '');
+  if (!/^https?:\/\//i.test(cleanUrl)) throw new Error('URL must start with http:// or https://.');
+
+  entry.name = cleanName;
+  entry.url = cleanUrl;
+  entry.adminUser = adminUser ? String(adminUser) : 'admin';
+  if (adminPass) entry.adminPass = String(adminPass);
+  entry.updatedAt = new Date().toISOString();
+
+  writeCustomSites(custom);
+  reload();
+  return SITES[key];
+}
+
 /** Remove a site previously added via addSite(). Config-file sites can't be
  *  removed here by design — sites.config.json stays the source of truth for
  *  anything checked into a team's local setup. */
@@ -484,6 +509,7 @@ module.exports = {
   siteEnv,
   targetKey,
   addSite,
+  updateSite,
   removeSite,
   get usingExampleConfig() { return LOADED.usingExample; },
   get configFile() { return LOADED.file; },

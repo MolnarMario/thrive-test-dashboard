@@ -33,8 +33,19 @@ npm install        # installs express (only dependency)
 npm start          # → http://localhost:4400
 ```
 
-Then open **http://localhost:4400**. On boot it prints one line per configured
-suite saying whether it is runnable, and why not if it isn't.
+Then open **http://localhost:4400** and sign in. On boot it prints one line per
+configured suite saying whether it is runnable, and why not if it isn't.
+
+The first time it starts with no users, it creates an admin account and says so
+in the boot banner:
+
+```
+username: admin
+password: admin!
+```
+
+**Change that password immediately** — from the top bar's *Password* button, or
+by resetting it from the *Users* tab. See [Access control](#access-control).
 
 Prerequisites:
 
@@ -109,6 +120,57 @@ site **already running in Local** (the dashboard can't start it for you).
 
 Checkouts live under `~/.wp-pr-builder/<project>/` (override with
 `PR_BUILDER_HOME`); build records and logs under `data/pr-builds/`.
+
+## Access control
+
+Everything is behind a login — the API, the dashboard, the Playwright reports
+and the live streams alike. Signing in gets you a session cookie that lasts 12
+hours and refreshes while you're using it.
+
+### Roles
+
+A role sets what someone can do by default. Everyone signed in can always
+*look*: the test tree, live runs, history, the calendar, reports and artifacts.
+Roles only govern what changes things.
+
+| | admin | tester | viewer |
+| --- | --- | --- | --- |
+| Run, re-run and cancel tests | ✓ | ✓ | |
+| Create and fire schedules | ✓ | ✓ | |
+| Use the PR Builder | ✓ | ✓ | |
+| Add and remove sites | ✓ | | |
+| Manage users and permissions | ✓ | | |
+
+### Handing out one permission
+
+The role is a starting point, not a cage. In the **Users** tab an admin can tick
+or untick any single permission for one person — grant a tester `Manage sites`
+without making them an admin, or take `Run tests` off a tester who should only
+watch for a while. An explicitly set permission shows in green; the rest simply
+follow the role, and re-ticking a box back to its role default clears the
+override again.
+
+Admins always hold every permission — the checkboxes are fixed for them, and the
+last remaining admin can be neither demoted nor deleted, so the dashboard can't
+lock everyone out.
+
+Deleting a user, or resetting their password, signs them out everywhere at once.
+
+### Where it's stored
+
+`data/users.json` and `data/sessions.json`, in the same gitignored `data/` dir as
+run history. Passwords are stored as salted scrypt hashes, never in plaintext.
+There are no new dependencies — `node:crypto` does the work.
+
+### Hosting notes
+
+The defaults assume an internal network over plain HTTP. If you put the
+dashboard behind HTTPS, set `SECURE_COOKIES=1` so the session cookie is only
+ever sent over TLS.
+
+Passwords cross the wire in cleartext on plain HTTP. That is fine on a trusted
+LAN and **not** fine on the open internet — put it behind HTTPS (and a VPN or an
+IP allow-list) before exposing it.
 
 ## Configuration
 
@@ -185,6 +247,7 @@ Env overrides:
 - `DASHBOARD_JAVA_HOME`, `DASHBOARD_MAVEN_HOME` — JVM toolchain locations
 - `SITE_START_STAGGER_MS`, `MAX_CONCURRENT_SITES`, `SITE_START_PRIORITY`
 - `PORT` — HTTP port (default `4400`)
+- `SECURE_COOKIES` — set to `1` when serving over HTTPS
 
 ## Data layout
 

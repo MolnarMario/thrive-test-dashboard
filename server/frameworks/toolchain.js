@@ -35,10 +35,18 @@ function firstExisting(candidates) {
       continue;
     }
     // Single `*` segment: list the parent and try each match, newest name last.
+    // The star's component may have a literal prefix (`jdk-*`) or be the whole
+    // segment (`.jdks\*`) — find the separator immediately before it either way,
+    // rather than path.dirname()'ing a slice that can itself end in a separator
+    // (which strips an extra path level for the whole-segment case).
     const star = c.indexOf('*');
-    const parent = path.dirname(c.slice(0, star));
+    const segStart = (() => {
+      const i = c.lastIndexOf(path.sep, star);
+      return i < 0 ? 0 : i + 1;
+    })();
+    const parent = segStart > 0 ? c.slice(0, segStart - 1) : '.';
     const tailStart = c.indexOf(path.sep, star) < 0 ? c.length : c.indexOf(path.sep, star);
-    const pattern = c.slice(path.dirname(c.slice(0, star)).length + 1, tailStart);
+    const pattern = c.slice(segStart, tailStart);
     const tail = c.slice(tailStart);
     let entries;
     try {

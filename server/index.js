@@ -14,9 +14,80 @@ const { buildCombinedReportHtml } = require('./combined-report');
 const preflight = require('./preflight');
 const scheduler = require('./scheduler');
 const prbuilder = require('./prbuilder');
+const auth = require('./auth');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
+
+/* --------------------------------- auth ---------------------------------- */
+// Order matters: hydrate the session, expose the handful of endpoints a signed
+// -out browser needs, then close the gate. Everything below it — API routes,
+// static files, reports, SSE — requires a session.
+
+app.use(auth.attachUser);
+
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body || {};
+  const result = auth.login(username, password);
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+  auth.setSessionCookie(res, result.sid);
+  res.json({ user: auth.publicUser(result.user) });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  auth.logout(req.sessionId);
+  auth.clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+// The frontend's single source of truth for what to render. Public so the app
+// can ask "am I signed in?" without provoking a 401 in the console.
+app.get('/api/auth/me', (req, res) => {
+  res.json({ user: req.user ? auth.publicUser(req.user) : null });
+});
+
+app.use(auth.gate);
+
+// Change your own password. Signs out this account's other sessions.
+app.post('/api/auth/password', (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+  try {
+    res.json({ user: auth.changePassword(req.user, currentPassword, newPassword, req.sessionId) });
+  } catch (err) {
+    res.status(400).json({ error: String(err.message || err) });
+  }
+});
+
+/* --------------------------------- users --------------------------------- */
+
+app.get('/api/users', auth.requirePermission('users.manage'), (_req, res) => {
+  res.json({ users: auth.listUsers(), roles: auth.ROLES, permissions: auth.PERMISSIONS, roleDefaults: auth.ROLE_DEFAULTS });
+});
+
+app.post('/api/users', auth.requirePermission('users.manage'), (req, res) => {
+  try {
+    res.status(201).json({ user: auth.createUser(req.body || {}, req.user) });
+  } catch (err) {
+    res.status(400).json({ error: String(err.message || err) });
+  }
+});
+
+app.patch('/api/users/:username', auth.requirePermission('users.manage'), (req, res) => {
+  try {
+    res.json({ user: auth.updateUser(req.params.username, req.body || {}, req.user) });
+  } catch (err) {
+    res.status(400).json({ error: String(err.message || err) });
+  }
+});
+
+app.delete('/api/users/:username', auth.requirePermission('users.manage'), (req, res) => {
+  try {
+    res.json(auth.deleteUser(req.params.username, req.user));
+  } catch (err) {
+    res.status(400).json({ error: String(err.message || err) });
+  }
+});
+
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 /* --------------------------------- API ----------------------------------- */
@@ -31,7 +102,7 @@ app.get('/api/tree', async (req, res) => {
 });
 
 // Start a run.
-app.post('/api/runs', (req, res) => {
+app.post('/api/runs', auth.requirePermission('tests.run'), (req, res) => {
   const { targets, label } = req.body || {};
   try {
     const { id } = orchestrator.startRun(targets, label);
@@ -66,7 +137,7 @@ app.get('/api/runs/:id', (req, res) => {
 });
 
 // Cancel a run.
-app.post('/api/runs/:id/cancel', (req, res) => {
+app.post('/api/runs/:id/cancel', auth.requirePermission('tests.run'), (req, res) => {
   const ok = orchestrator.cancelRun(req.params.id);
   res.status(ok ? 202 : 404).json({ cancelling: ok });
 });
@@ -74,7 +145,7 @@ app.post('/api/runs/:id/cancel', (req, res) => {
 // Cancel a single target within a run (kills just that target's process,
 // frees it). `:target` is the "<suite>__<site>" key; a bare site key is still
 // accepted so older links keep working.
-app.post('/api/runs/:id/targets/:target/cancel', (req, res) => {
+app.post('/api/runs/:id/targets/:target/cancel', auth.requirePermission('tests.run'), (req, res) => {
   const ok = orchestrator.cancelTarget(req.params.id, req.params.target);
   res.status(ok ? 202 : 404).json({ cancelling: ok });
 });
@@ -241,7 +312,7 @@ app.get('/api/sites', (_req, res) => {
 
 // Add a site from the dashboard UI; selectable in every suite's dropdown
 // immediately (config.addSite() reloads SITES/SUITES in place, no restart).
-app.post('/api/sites', (req, res) => {
+app.post('/api/sites', auth.requirePermission('sites.manage'), (req, res) => {
   try {
     const site = config.addSite(req.body || {});
     res.status(201).json({ site: { key: site.key, name: site.name, url: site.url, custom: true } });
@@ -250,9 +321,20 @@ app.post('/api/sites', (req, res) => {
   }
 });
 
+// Edit a site added through the UI. Sites from sites.config.json can't be
+// edited here — that file stays the source of truth for those.
+app.patch('/api/sites/:key', auth.requirePermission('sites.manage'), (req, res) => {
+  try {
+    const site = config.updateSite(req.params.key, req.body || {});
+    res.json({ site: { key: site.key, name: site.name, url: site.url, custom: true } });
+  } catch (err) {
+    res.status(400).json({ error: String(err.message || err) });
+  }
+});
+
 // Remove a site added through the UI. Sites from sites.config.json can't be
 // removed here — that file stays the source of truth for those.
-app.delete('/api/sites/:key', (req, res) => {
+app.delete('/api/sites/:key', auth.requirePermission('sites.manage'), (req, res) => {
   try {
     config.removeSite(req.params.key);
     res.json({ deleted: true });
@@ -294,7 +376,7 @@ app.get('/api/calendar', (req, res) => {
 // --- Schedules (Phase 5) ---
 app.get('/api/schedules', (_req, res) => res.json({ schedules: scheduler.list() }));
 
-app.post('/api/schedules', (req, res) => {
+app.post('/api/schedules', auth.requirePermission('schedules.manage'), (req, res) => {
   try {
     res.status(201).json({ schedule: scheduler.create(req.body) });
   } catch (err) {
@@ -302,7 +384,7 @@ app.post('/api/schedules', (req, res) => {
   }
 });
 
-app.put('/api/schedules/:id', (req, res) => {
+app.put('/api/schedules/:id', auth.requirePermission('schedules.manage'), (req, res) => {
   try {
     res.json({ schedule: scheduler.update(req.params.id, req.body) });
   } catch (err) {
@@ -310,7 +392,7 @@ app.put('/api/schedules/:id', (req, res) => {
   }
 });
 
-app.post('/api/schedules/:id/toggle', (req, res) => {
+app.post('/api/schedules/:id/toggle', auth.requirePermission('schedules.manage'), (req, res) => {
   try {
     res.json({ schedule: scheduler.setEnabled(req.params.id, req.body && req.body.enabled) });
   } catch (err) {
@@ -318,12 +400,12 @@ app.post('/api/schedules/:id/toggle', (req, res) => {
   }
 });
 
-app.post('/api/schedules/:id/run', (req, res) => {
+app.post('/api/schedules/:id/run', auth.requirePermission('schedules.manage', 'tests.run'), (req, res) => {
   const result = scheduler.fire(req.params.id);
   res.status(result.ok ? 202 : 409).json(result);
 });
 
-app.delete('/api/schedules/:id', (req, res) => {
+app.delete('/api/schedules/:id', auth.requirePermission('schedules.manage'), (req, res) => {
   scheduler.remove(req.params.id);
   res.json({ deleted: true });
 });
@@ -368,7 +450,7 @@ app.get('/api/prbuilder/builds/:id', (req, res) => {
   res.status(404).json({ error: 'Build not found' });
 });
 
-app.post('/api/prbuilder/build', (req, res) => {
+app.post('/api/prbuilder/build', auth.requirePermission('prbuilder.use'), (req, res) => {
   try {
     res.status(201).json(prbuilder.startBuild(req.body || {}));
   } catch (err) {
@@ -378,7 +460,7 @@ app.post('/api/prbuilder/build', (req, res) => {
 
 // Run the test suite against the PR-built site. The orchestrator handles the
 // run (single-site target), so it shows up in Live + History like any run.
-app.post('/api/prbuilder/test', (req, res) => {
+app.post('/api/prbuilder/test', auth.requirePermission('prbuilder.use', 'tests.run'), (req, res) => {
   try {
     const { target, label } = prbuilder.buildTestTarget(req.body || {});
     const { id } = orchestrator.startRun([target], label);
@@ -389,7 +471,7 @@ app.post('/api/prbuilder/test', (req, res) => {
   }
 });
 
-app.post('/api/prbuilder/builds/:id/cancel', (req, res) => {
+app.post('/api/prbuilder/builds/:id/cancel', auth.requirePermission('prbuilder.use'), (req, res) => {
   const ok = prbuilder.cancelBuild(req.params.id);
   res.status(ok ? 202 : 404).json({ cancelling: ok });
 });
@@ -440,6 +522,7 @@ function localDay(iso) {
 /* ------------------------------- bootstrap -------------------------------- */
 
 store.ensureDir(RUNS_DIR);
+const seededAdmin = auth.init();
 orchestrator.recoverInterrupted();
 prbuilder.recoverInterrupted();
 scheduler.init();
@@ -470,6 +553,14 @@ app.listen(PORT, () => {
     if (!ok) console.warn(`      ${suite.reason || tooling.message}`);
   }
   console.log('');
+  if (seededAdmin && seededAdmin.password) {
+    console.warn('  ┌──────────────────────────────────────────────────────────┐');
+    console.warn('  │  No users existed, so a first admin account was created. │');
+    console.warn(`  │    username: ${seededAdmin.username.padEnd(44)}│`);
+    console.warn(`  │    password: ${seededAdmin.password.padEnd(44)}│`);
+    console.warn('  │  Change it from the Users tab after signing in.          │');
+    console.warn('  └──────────────────────────────────────────────────────────┘\n');
+  }
   /* eslint-enable no-console */
 });
 
