@@ -98,8 +98,20 @@ const PERMISSIONS = [
 const ROLES = ['admin', 'tester', 'viewer'];
 
 /**
+ * Sites hold every tested site's credentials, and users control who can sign
+ * in at all — both are the keys to the whole install, not a capability like
+ * "can run tests" that's fine to delegate a la carte. So unlike the other
+ * permissions, these two are never read from a user's `permissions` overrides:
+ * an admin can still flip a checkbox in the Users tab, but it's silently
+ * dropped (see sanitiseOverrides) rather than taking effect. Only a role
+ * change to 'admin' grants them.
+ */
+const ADMIN_ONLY_PERMISSIONS = ['sites.manage', 'users.manage'];
+
+/**
  * What each role can do out of the box. A user's own `permissions` object
- * overrides individual entries, so an admin can hand out one extra capability
+ * overrides individual entries — except ADMIN_ONLY_PERMISSIONS, which always
+ * follow the role — so an admin can hand out one extra delegable capability
  * without promoting anyone.
  */
 const ROLE_DEFAULTS = {
@@ -123,7 +135,9 @@ const ROLE_DEFAULTS = {
 /**
  * Effective permissions = role defaults with the user's overrides on top.
  * Admins are hard-wired to everything so nobody can lock the last admin out of
- * user management by unticking a box.
+ * user management by unticking a box. ADMIN_ONLY_PERMISSIONS are likewise
+ * hard-wired to *off* for everyone else: they cannot be delegated by override,
+ * only by promotion.
  */
 function effectivePermissions(user) {
   if (!user) return {};
@@ -131,6 +145,10 @@ function effectivePermissions(user) {
   for (const p of PERMISSIONS) {
     if (user.role === 'admin') {
       out[p] = true;
+      continue;
+    }
+    if (ADMIN_ONLY_PERMISSIONS.includes(p)) {
+      out[p] = false;
       continue;
     }
     const override = user.permissions ? user.permissions[p] : undefined;
@@ -663,11 +681,16 @@ function adminCount(list) {
   return list.filter((u) => u.role === 'admin').length;
 }
 
-/** Only known permissions, only real booleans - absent means "follow the role". */
+/**
+ * Only known permissions, only real booleans, and never one of
+ * ADMIN_ONLY_PERMISSIONS - absent means "follow the role". Applied whether the
+ * request came from the Users tab or a hand-crafted API call, so there's no
+ * path that writes 'sites.manage' or 'users.manage' onto a non-admin record.
+ */
 function sanitiseOverrides(raw) {
   const out = {};
   for (const [k, v] of Object.entries(raw || {})) {
-    if (PERMISSIONS.includes(k) && typeof v === 'boolean') out[k] = v;
+    if (PERMISSIONS.includes(k) && !ADMIN_ONLY_PERMISSIONS.includes(k) && typeof v === 'boolean') out[k] = v;
   }
   return out;
 }
@@ -827,6 +850,7 @@ async function init() {
 
 module.exports = {
   PERMISSIONS,
+  ADMIN_ONLY_PERMISSIONS,
   ROLES,
   ROLE_DEFAULTS,
   passwordPolicy,

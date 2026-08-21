@@ -137,7 +137,13 @@ app.post('/api/auth/password', async (req, res) => {
 /* --------------------------------- users --------------------------------- */
 
 app.get('/api/users', auth.requirePermission('users.manage'), (_req, res) => {
-  res.json({ users: auth.listUsers(), roles: auth.ROLES, permissions: auth.PERMISSIONS, roleDefaults: auth.ROLE_DEFAULTS });
+  res.json({
+    users: auth.listUsers(),
+    roles: auth.ROLES,
+    permissions: auth.PERMISSIONS,
+    roleDefaults: auth.ROLE_DEFAULTS,
+    adminOnlyPermissions: auth.ADMIN_ONLY_PERMISSIONS,
+  });
 });
 
 app.post('/api/users', auth.requirePermission('users.manage'), async (req, res) => {

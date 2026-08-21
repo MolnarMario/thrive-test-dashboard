@@ -2402,7 +2402,7 @@ const PERM_LABELS = {
   'users.manage': 'Manage users',
 };
 
-const USERS = { list: [], roles: [], permissions: [], roleDefaults: {} };
+const USERS = { list: [], roles: [], permissions: [], roleDefaults: {}, adminOnlyPermissions: [] };
 
 async function loadUsers() {
   try {
@@ -2412,6 +2412,7 @@ async function loadUsers() {
       roles: data.roles || [],
       permissions: data.permissions || [],
       roleDefaults: data.roleDefaults || {},
+      adminOnlyPermissions: data.adminOnlyPermissions || [],
     });
     renderUsers();
   } catch (e) {
@@ -2452,6 +2453,7 @@ function renderUsers() {
     // A tick writes an explicit override; matching the role default again
     // clears it, so "follows the role" stays the resting state.
     const perms = el('div', { class: 'user-perms' }, ...USERS.permissions.map((p) => {
+      const adminOnly = USERS.adminOnlyPermissions.includes(p);
       const cb = el('input', {
         type: 'checkbox',
         onchange: () => {
@@ -2466,11 +2468,19 @@ function renderUsers() {
       if (u.role === 'admin') {
         cb.disabled = true;
         cb.title = 'Admins hold every permission.';
+      } else if (adminOnly) {
+        // Not a delegable capability: the server ignores any override for
+        // this key, so don't offer a control that would silently no-op.
+        cb.disabled = true;
+        cb.title = 'Admin-only. Promote this account to grant it — it cannot be delegated.';
       }
-      const overridden = u.overrides && Object.prototype.hasOwnProperty.call(u.overrides, p);
+      // A pre-existing override on an admin-only key is dead data (the server
+      // ignores it — see sanitiseOverrides) rather than a live grant, so don't
+      // badge it as one.
+      const overridden = !adminOnly && u.overrides && Object.prototype.hasOwnProperty.call(u.overrides, p);
       return el('label', {
-        class: 'user-perm' + (overridden ? ' overridden' : ''),
-        title: overridden ? 'Set explicitly for this user' : 'Follows the role default',
+        class: 'user-perm' + (overridden ? ' overridden' : '') + (adminOnly && u.role !== 'admin' ? ' admin-only' : ''),
+        title: overridden ? 'Set explicitly for this user' : adminOnly && u.role !== 'admin' ? cb.title : 'Follows the role default',
       }, cb, PERM_LABELS[p] || p);
     }));
 

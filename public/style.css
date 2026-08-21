@@ -601,6 +601,9 @@ input[type="password"]:focus { outline: none; border-color: var(--accent); box-s
 /* an explicit grant/revoke, as opposed to whatever the role implies */
 .user-perm.overridden { color: var(--accent-dk); font-weight: 650; }
 .user-perm input:disabled + * , .user-perm input:disabled { cursor: not-allowed; }
+/* admin-only: greyed out rather than a normal unchecked box, so it doesn't
+   read as "off by role default" — it can't be turned on here at all */
+.user-perm.admin-only { opacity: 0.45; }
 .user-actions { display: flex; gap: 6px; margin-left: auto; }
 .danger.sm, .ghost.sm { padding: 5px 9px; font-size: 12px; }
 
