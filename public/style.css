@@ -313,7 +313,7 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ----------------------------- status badges ---------------------------- */
-.st { font-size: 10.5px; font-weight: 700; text-transform: uppercase; padding: 3px 9px; border-radius: 20px; letter-spacing: 0.4px; border: 1px solid transparent; }
+.st { display: inline-block; font-size: 10.5px; font-weight: 700; text-transform: uppercase; padding: 3px 9px; border-radius: 20px; letter-spacing: 0.4px; border: 1px solid transparent; white-space: nowrap; }
 .st-passed { background: rgba(47, 158, 79, 0.14); color: #1f8a40; border-color: rgba(47, 158, 79, 0.28); }
 .st-failed, .st-error { background: rgba(223, 63, 51, 0.13); color: #c5301f; border-color: rgba(223, 63, 51, 0.3); }
 .st-running, .st-authenticating { background: rgba(47, 128, 200, 0.13); color: #2168aa; border-color: rgba(47, 128, 200, 0.3); }
@@ -321,12 +321,16 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
 .st-skipped, .st-cancelled, .st-interrupted { background: #eef1f4; color: var(--muted); border-color: var(--border); }
 
 /* -------------------------------- history ------------------------------- */
-.history-list table { width: 100%; border-collapse: collapse; }
-.history-list th, .history-list td { text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.history-list table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.history-list th, .history-list td { text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--border); font-size: 13px; white-space: nowrap; }
 .history-list th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
 .history-list tbody tr { transition: background 0.12s var(--ease); }
 .history-list tr.clickable:hover { background: var(--panel-2); cursor: pointer; }
 .history-list td { color: var(--text-dim); }
+.history-list td:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-list th:nth-child(4), .history-list td:nth-child(4) { width: 110px; }
+.history-list th:nth-child(5), .history-list td:nth-child(5) { width: 150px; }
+.mini-counts { white-space: nowrap; }
 .mini-counts span { margin-right: 10px; font-variant-numeric: tabular-nums; }
 .history-list td.fail-rate { font-weight: 700; font-variant-numeric: tabular-nums; }
 .back-link { color: var(--accent-dk); font-weight: 600; cursor: pointer; display: inline-block; margin-bottom: 12px; transition: color 0.15s var(--ease); }
@@ -531,6 +535,85 @@ input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent);
 }
 .sched-target .spacer { flex: 1; }
 .sched-target-name { font-weight: 650; }
+.sched-target-edit { margin: 0; padding: 12px; }
 
 .env-bad { color: var(--red); font-weight: 700; margin-right: 8px; }
 .env { display: inline-flex; align-items: center; }
+
+/* --------------------------- sign-in + accounts --------------------------- */
+/* The login page reuses this stylesheet wholesale, so it inherits the body
+   wash and the same controls as the dashboard behind it. */
+
+input[type="password"] {
+  background: #fff; border: 1px solid var(--border); color: var(--text);
+  padding: 8px 11px; border-radius: var(--radius-sm);
+  transition: border-color 0.15s var(--ease), box-shadow 0.15s var(--ease);
+}
+input[type="password"]:focus { outline: none; border-color: var(--accent); box-shadow: var(--ring); }
+
+.login-body { display: grid; place-items: center; min-height: 100vh; padding: 24px; }
+.login-card {
+  width: 100%; max-width: 380px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: var(--shadow-lg); padding: 30px 28px 24px;
+}
+.login-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
+.login-brand .brand-mark svg { width: 38px; height: 38px; display: block; }
+.login-brand .brand-text { display: flex; flex-direction: column; }
+.login-card label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; }
+.login-card input { width: 100%; }
+.login-card .primary { width: 100%; margin-top: 20px; padding: 11px; }
+.login-note { margin: 16px 0 0; text-align: center; }
+
+/* signed-in identity, far right of the top bar */
+.user-chip {
+  display: flex; align-items: center; gap: 6px; margin-left: 10px;
+  padding: 4px 5px 4px 12px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--border);
+}
+.user-chip-name { font-weight: 650; font-size: 12.5px; }
+.user-chip .ghost { white-space: nowrap; }
+.user-chip-role {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700;
+  color: var(--accent-dk); background: rgba(92, 185, 70, 0.14);
+  padding: 2px 7px; border-radius: 999px;
+}
+
+/* users tab — one row per account, permissions inline */
+.user-row {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-sm); padding: 12px 16px; margin-bottom: 8px;
+}
+.user-id { display: flex; align-items: center; gap: 7px; min-width: 190px; }
+.user-name { font-weight: 650; }
+.user-you {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700;
+  color: var(--muted); background: var(--panel-2); padding: 2px 6px; border-radius: 999px;
+}
+.user-warn { font-size: 11.5px; color: var(--yellow); }
+.user-role { width: 110px; text-transform: capitalize; }
+.user-perms { display: flex; gap: 14px; flex-wrap: wrap; flex: 1; min-width: 260px; }
+.user-perm {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 12.5px; color: var(--text-dim); white-space: nowrap;
+}
+/* an explicit grant/revoke, as opposed to whatever the role implies */
+.user-perm.overridden { color: var(--accent-dk); font-weight: 650; }
+.user-perm input:disabled + * , .user-perm input:disabled { cursor: not-allowed; }
+/* admin-only: greyed out rather than a normal unchecked box, so it doesn't
+   read as "off by role default" — it can't be turned on here at all */
+.user-perm.admin-only { opacity: 0.45; }
+.user-actions { display: flex; gap: 6px; margin-left: auto; }
+.danger.sm, .ghost.sm { padding: 5px 9px; font-size: 12px; }
+
+/* Password dialog — the one modal that must never fall back to window.prompt(),
+   which paints what you type straight onto the screen. */
+.pw-modal { width: min(420px, 94vw); }
+.pw-form { padding: 16px 18px; }
+.pw-form .modal-error { margin-bottom: 12px; }
+.pw-field + .pw-field { margin-top: 14px; }
+.pw-field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.pw-field input { width: 100%; }
+.pw-field .muted-note { margin: 6px 0 0; }
+.pw-actions { display: flex; gap: 8px; justify-content: flex-end; }

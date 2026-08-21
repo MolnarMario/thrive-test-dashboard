@@ -89,9 +89,10 @@ function failRatePct(run) {
   return r > 0 && pct === 0 ? '<1%' : `${pct}%`;
 }
 
-/** Re-runnable = a finished run that didn't fully pass. */
+/** Re-runnable = a finished run that didn't fully pass, if you may start runs. */
 function rerunnable(run) {
-  return !!(run && run.status && run.status !== 'passed' && run.status !== 'running');
+  return can('tests.run')
+    && !!(run && run.status && run.status !== 'passed' && run.status !== 'running');
 }
 
 /** Re-run the same targets/specs as a previous run, instantly. */
@@ -120,9 +121,106 @@ async function rerunRun(id) {
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
+  // An expired or revoked session shouldn't surface as a cryptic "HTTP 401"
+  // in an alert — send the user to the login form and keep where they were.
+  if (res.status === 401) {
+    location.replace('/login.html?next=' + encodeURIComponent(location.pathname + location.search));
+    await new Promise(() => {}); // never settles; the navigation takes over
+  }
   const data = await res.json().catch(() => ({}));
+  // An account still on a password somebody else chose is signed in but inert
+  // until it sets its own. Any call can be the one that discovers this — a tab
+  // left open across an admin's password reset, say.
+  if (res.status === 403 && data.mustChangePassword) {
+    if (ME) ME.mustChangePassword = true;
+    changeMyPassword(true);
+    await new Promise(() => {}); // the dialog owns the session from here
+  }
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
+}
+
+/* --------------------------------- access ---------------------------------- */
+
+/** The signed-in user, as /api/auth/me described them. Set once, in init(). */
+let ME = null;
+
+/** The server's password rules, so every field can state them before you type. */
+let PASSWORD_POLICY = { minLength: 12, description: 'At least 12 characters.' };
+
+/**
+ * Ask for one or more passwords in a modal with real password fields.
+ *
+ * Replaces window.prompt(), which renders what you type in plain text on
+ * screen, offers no confirmation field, and can't be dismissed conditionally —
+ * all three of which matter when the thing being typed is a credential.
+ *
+ * @param {{title: string, fields: {key: string, label: string, hint?: string}[],
+ *          submitLabel?: string, dismissible?: boolean,
+ *          onSubmit: (values: object) => Promise<void>}} opts
+ */
+let passwordDialogOpen = false;
+
+function passwordDialog(opts) {
+  // Several in-flight calls can each come back with the same 403; one dialog
+  // is the answer to all of them.
+  if (passwordDialogOpen) return;
+  passwordDialogOpen = true;
+
+  const inputs = new Map();
+  const errBox = el('div', { class: 'modal-error hidden' });
+
+  const rows = opts.fields.map((f) => {
+    const input = el('input', { type: 'password', autocomplete: 'new-password' });
+    inputs.set(f.key, input);
+    return el('div', { class: 'pw-field' },
+      el('label', {}, f.label),
+      input,
+      f.hint ? el('p', { class: 'muted-note' }, f.hint) : null);
+  });
+
+  const submit = el('button', { class: 'primary', onclick: run }, opts.submitLabel || 'Save');
+  const panel = el('div', { class: 'modal pw-modal' },
+    el('div', { class: 'modal-head' }, el('div', { class: 'modal-title' }, opts.title)),
+    el('div', { class: 'pw-form' }, errBox, ...rows),
+    el('div', { class: 'modal-footer pw-actions' },
+      submit,
+      opts.dismissible === false
+        ? null
+        : el('button', { class: 'ghost', onclick: close }, 'Cancel')));
+
+  const overlay = el('div', { class: 'modal-overlay' }, panel);
+  document.body.append(overlay);
+  inputs.values().next().value.focus();
+
+  for (const input of inputs.values()) {
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') run(); });
+  }
+
+  function close() {
+    overlay.remove();
+    passwordDialogOpen = false;
+  }
+
+  async function run() {
+    errBox.classList.add('hidden');
+    const values = {};
+    for (const [key, input] of inputs) values[key] = input.value;
+    submit.disabled = true;
+    try {
+      await opts.onSubmit(values);
+      close();
+    } catch (e) {
+      errBox.textContent = e.message;
+      errBox.classList.remove('hidden');
+      submit.disabled = false;
+    }
+  }
+}
+
+/** Does the signed-in user hold this permission? Viewing needs none. */
+function can(permission) {
+  return !!(ME && ME.permissions && ME.permissions[permission]);
 }
 
 /* ------------------------------- tab switching ----------------------------- */
@@ -137,6 +235,8 @@ function showTab(name) {
   if (name === 'calendar') renderCalendar();
   if (name === 'schedules') loadSchedules();
   if (name === 'prbuilder') loadPrBuilder();
+  if (name === 'sites') loadSites();
+  if (name === 'users') loadUsers();
 }
 
 $$('.tab').forEach((t) => t.addEventListener('click', () => showTab(t.dataset.tab)));
@@ -722,14 +822,112 @@ async function checkSites(keys) {
 }
 
 /* ---------------------------------- sites ---------------------------------- */
+// A dedicated tab (admins only, see applyPermissions) rather than a panel
+// bolted onto the Run toolbar — the same shape as the Users tab. Every site
+// (config-file or dashboard-added) is listed here; only dashboard-added ones
+// carry Edit/Delete, since sites.config.json stays the source of truth for
+// hand-checked-in sites.
 
-$('#btnAddSite').addEventListener('click', () => {
-  const box = $('#siteForm');
-  if (box.classList.contains('hidden')) showSiteForm();
-  else box.classList.add('hidden');
-});
+const SITES_STATE = { list: [] };
 
-async function showSiteForm() {
+async function loadSites() {
+  try {
+    const { sites } = await api('/api/sites');
+    SITES_STATE.list = sites || [];
+    renderSites();
+  } catch (e) {
+    $('#siteList').textContent = 'Could not load sites: ' + e.message;
+  }
+}
+
+function siteError(msg) {
+  const box = $('#siteError');
+  box.textContent = msg || '';
+  box.classList.toggle('hidden', !msg);
+}
+
+function renderSites() {
+  const box = $('#siteList');
+  box.innerHTML = '';
+  if (!SITES_STATE.list.length) return void (box.textContent = 'No sites configured.');
+  for (const s of SITES_STATE.list) box.append(siteRow(s));
+}
+
+function siteRow(s) {
+  const row = el('div', { class: 'sched-card' },
+    el('div', {},
+      el('div', { class: 'sname' }, s.name),
+      el('div', { class: 'meta' }, s.url)),
+    el('span', { class: 'spacer' }));
+
+  if (s.custom) {
+    row.append(
+      el('button', { class: 'ghost sm', onclick: () => showEditSiteForm(row, s) }, 'Edit'),
+      el('button', { class: 'danger sm', onclick: () => deleteSite(s) }, 'Delete'));
+  } else {
+    row.append(el('span', {
+      class: 'meta',
+      title: 'Defined in sites.config.json — edit that file to change it.',
+    }, 'config file'));
+  }
+  return row;
+}
+
+async function deleteSite(s) {
+  if (!confirm(`Remove site "${s.name}"? Suites currently pointed at it will need a different site.`)) return;
+  siteError('');
+  try {
+    await api(`/api/sites/${s.key}`, { method: 'DELETE' });
+    await loadTree(true); // refresh the Run tab's site dropdowns immediately
+  } catch (e) {
+    siteError(e.message);
+  }
+  loadSites();
+}
+
+/** Swap one site row for an inline edit form, prefilled with its current
+ *  name/url/admin user. The password field is left blank — submitting it
+ *  blank keeps the existing password (credentials never round-trip to the
+ *  browser once saved). */
+function showEditSiteForm(row, s) {
+  siteError('');
+  const name = el('input', { type: 'text', value: s.name });
+  const url = el('input', { type: 'text', value: s.url });
+  const user = el('input', { type: 'text', placeholder: 'admin' });
+  const pass = el('input', { type: 'password', placeholder: '(unchanged)' });
+
+  const save = el('button', { class: 'primary' }, 'Save');
+  save.addEventListener('click', async () => {
+    siteError('');
+    try {
+      await api(`/api/sites/${s.key}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name.value, url: url.value, adminUser: user.value, adminPass: pass.value }),
+      });
+      await loadTree(true);
+      loadSites();
+    } catch (e) {
+      siteError(e.message);
+    }
+  });
+  const cancel = el('button', { class: 'ghost' }, 'Cancel');
+  cancel.addEventListener('click', renderSites);
+
+  const form = el('div', { class: 'sched-form sched-target-edit' },
+    el('div', { class: 'row' },
+      el('div', {}, el('label', {}, 'Name'), name),
+      el('div', {}, el('label', {}, 'URL'), url)),
+    el('div', { class: 'row' },
+      el('div', {}, el('label', {}, 'Admin username'), user),
+      el('div', {}, el('label', {}, 'Admin password'), pass)),
+    el('div', { class: 'actions' }, save, cancel));
+
+  row.replaceWith(form);
+}
+
+function showAddSiteForm() {
+  siteError('');
   const box = $('#siteForm');
   box.classList.remove('hidden');
   box.innerHTML = '';
@@ -737,31 +935,25 @@ async function showSiteForm() {
   const name = el('input', { type: 'text', placeholder: 'e.g. Staging' });
   const url = el('input', { type: 'text', placeholder: 'https://staging.example.com' });
   const user = el('input', { type: 'text', placeholder: 'admin', value: 'admin' });
-  const pass = el('input', { type: 'password', placeholder: 'admin' });
-  const err = el('div', { class: 'error-banner hidden' });
-  const list = el('div', { class: 'sched-targets' });
+  const pass = el('input', { type: 'password', autocomplete: 'new-password', placeholder: 'required' });
 
   const save = el('button', { class: 'primary' }, 'Add site');
   save.addEventListener('click', async () => {
-    err.classList.add('hidden');
+    siteError('');
     try {
       await api('/api/sites', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: name.value, url: url.value, adminUser: user.value, adminPass: pass.value }),
       });
-      name.value = '';
-      url.value = '';
-      user.value = 'admin';
-      pass.value = '';
+      box.classList.add('hidden');
       await loadTree(true);
-      await refreshCustomSiteList(list);
+      loadSites();
     } catch (e) {
-      err.textContent = e.message;
-      err.classList.remove('hidden');
+      siteError(e.message);
     }
   });
-  const cancel = el('button', { class: 'ghost' }, 'Close');
+  const cancel = el('button', { class: 'ghost' }, 'Cancel');
   cancel.addEventListener('click', () => box.classList.add('hidden'));
 
   box.append(
@@ -771,45 +963,18 @@ async function showSiteForm() {
     el('div', { class: 'row' },
       el('div', {}, el('label', {}, 'Admin username'), user),
       el('div', {}, el('label', {}, 'Admin password'), pass)),
-    err,
-    el('div', { class: 'actions' }, save, cancel),
-    list
-  );
-
-  await refreshCustomSiteList(list);
+    el('p', { class: 'muted-note' },
+      'Stored encrypted on the server and never sent back to the browser. ' +
+      'Runs need it to sign in to the site, so it cannot be hashed.'),
+    el('div', { class: 'actions' }, save, cancel));
+  name.focus();
 }
 
-/** List sites added from this panel, each removable — sites.config.json ones
- *  aren't shown here since they can't be deleted through the UI. */
-async function refreshCustomSiteList(list) {
-  list.innerHTML = '';
-  let sites = [];
-  try {
-    ({ sites } = await api('/api/sites'));
-  } catch (_) {
-    return;
-  }
-  const custom = sites.filter((s) => s.custom);
-  if (!custom.length) return;
-  for (const s of custom) {
-    const del = el('button', { class: 'ghost' }, '🗑');
-    del.addEventListener('click', async () => {
-      if (!confirm(`Remove site "${s.name}"?`)) return;
-      try {
-        await api(`/api/sites/${s.key}`, { method: 'DELETE' });
-        await loadTree(true);
-        await refreshCustomSiteList(list);
-      } catch (e) {
-        alert(e.message);
-      }
-    });
-    list.append(el('div', { class: 'sched-target' },
-      el('span', { class: 'sched-target-name' }, s.name),
-      el('span', { class: 'site-pick-label' }, s.url),
-      el('span', { class: 'spacer' }),
-      del));
-  }
-}
+$('#btnNewSite').addEventListener('click', () => {
+  const box = $('#siteForm');
+  if (box.classList.contains('hidden')) showAddSiteForm();
+  else box.classList.add('hidden');
+});
 
 /** Open/close every expandable row. */
 function setAllOpen(open) {
@@ -952,7 +1117,9 @@ function renderLive(run) {
     elapsed
   );
   if (run.status === 'running') {
-    head.append(el('button', { class: 'danger', onclick: () => cancelRun(run.id) }, 'Cancel run'));
+    if (can('tests.run')) {
+      head.append(el('button', { class: 'danger', onclick: () => cancelRun(run.id) }, 'Cancel run'));
+    }
   } else if (TERMINAL_RUN.includes(run.status)) {
     head.append(combinedReportLink(run.id));
   }
@@ -1314,6 +1481,7 @@ function renderTargetActions(box, runId, t) {
   if (!box) return;
   box.innerHTML = '';
   if (!runId) return;
+  if (!can('tests.run')) return; // a viewer watches; it doesn't steer
   const active = ['queued', 'authenticating', 'running'].includes(t.status);
   if (active) {
     box.append(el('button', {
@@ -2222,9 +2390,334 @@ async function prbLoadHistory() {
   }
 }
 
+/* ---------------------------------- users ---------------------------------- */
+// Admin-only tab. Reuses the schedules tab's list/form markup so it reads as
+// part of the app rather than a bolted-on admin panel.
+
+const PERM_LABELS = {
+  'tests.run': 'Run tests',
+  'schedules.manage': 'Schedules',
+  'sites.manage': 'Manage sites',
+  'prbuilder.use': 'PR Builder',
+  'users.manage': 'Manage users',
+};
+
+const USERS = { list: [], roles: [], permissions: [], roleDefaults: {}, adminOnlyPermissions: [] };
+
+async function loadUsers() {
+  try {
+    const data = await api('/api/users');
+    Object.assign(USERS, {
+      list: data.users || [],
+      roles: data.roles || [],
+      permissions: data.permissions || [],
+      roleDefaults: data.roleDefaults || {},
+      adminOnlyPermissions: data.adminOnlyPermissions || [],
+    });
+    renderUsers();
+  } catch (e) {
+    $('#userList').textContent = 'Could not load users: ' + e.message;
+  }
+}
+
+function userError(msg) {
+  const box = $('#userError');
+  box.textContent = msg || '';
+  box.classList.toggle('hidden', !msg);
+}
+
+/** True while this account is the last thing standing between us and lockout. */
+function isLastAdmin(u) {
+  return u.role === 'admin' && USERS.list.filter((x) => x.role === 'admin').length === 1;
+}
+
+function renderUsers() {
+  const box = $('#userList');
+  box.innerHTML = '';
+  if (!USERS.list.length) return void (box.textContent = 'No users yet.');
+
+  for (const u of USERS.list) {
+    const last = isLastAdmin(u);
+    const isMe = ME && u.username === ME.username;
+
+    const role = el('select', {
+      class: 'user-role',
+      onchange: () => saveUser(u.username, { role: role.value }),
+    }, ...USERS.roles.map((r) => el('option', { value: r }, r)));
+    role.value = u.role;
+    if (last) {
+      role.disabled = true;
+      role.title = 'The only admin — promote someone else before changing this.';
+    }
+
+    // A tick writes an explicit override; matching the role default again
+    // clears it, so "follows the role" stays the resting state.
+    const perms = el('div', { class: 'user-perms' }, ...USERS.permissions.map((p) => {
+      const adminOnly = USERS.adminOnlyPermissions.includes(p);
+      const cb = el('input', {
+        type: 'checkbox',
+        onchange: () => {
+          const overrides = { ...(u.overrides || {}) };
+          const roleDefault = !!(USERS.roleDefaults[u.role] || {})[p];
+          if (cb.checked === roleDefault) delete overrides[p];
+          else overrides[p] = cb.checked;
+          saveUser(u.username, { permissions: overrides });
+        },
+      });
+      cb.checked = !!u.permissions[p];
+      if (u.role === 'admin') {
+        cb.disabled = true;
+        cb.title = 'Admins hold every permission.';
+      } else if (adminOnly) {
+        // Not a delegable capability: the server ignores any override for
+        // this key, so don't offer a control that would silently no-op.
+        cb.disabled = true;
+        cb.title = 'Admin-only. Promote this account to grant it — it cannot be delegated.';
+      }
+      // A pre-existing override on an admin-only key is dead data (the server
+      // ignores it — see sanitiseOverrides) rather than a live grant, so don't
+      // badge it as one.
+      const overridden = !adminOnly && u.overrides && Object.prototype.hasOwnProperty.call(u.overrides, p);
+      return el('label', {
+        class: 'user-perm' + (overridden ? ' overridden' : '') + (adminOnly && u.role !== 'admin' ? ' admin-only' : ''),
+        title: overridden ? 'Set explicitly for this user' : adminOnly && u.role !== 'admin' ? cb.title : 'Follows the role default',
+      }, cb, PERM_LABELS[p] || p);
+    }));
+
+    const actions = el('div', { class: 'user-actions' },
+      el('button', { class: 'ghost sm', onclick: () => resetPassword(u) }, 'Reset password'),
+      el('button', {
+        class: 'danger sm',
+        disabled: last || isMe ? '' : null,
+        title: last
+          ? 'The only admin cannot be deleted.'
+          : isMe ? 'You cannot delete your own account.' : 'Delete this user',
+        onclick: () => deleteUser(u),
+      }, 'Delete'));
+
+    box.append(el('div', { class: 'user-row' },
+      el('div', { class: 'user-id' },
+        el('span', { class: 'user-name' }, u.username),
+        isMe ? el('span', { class: 'user-you' }, 'you') : null,
+        u.mustChangePassword ? el('span', { class: 'user-warn' }, 'password not changed yet') : null),
+      role,
+      perms,
+      actions));
+  }
+}
+
+async function saveUser(username, patch) {
+  userError('');
+  try {
+    await api(`/api/users/${encodeURIComponent(username)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+  } catch (e) {
+    userError(e.message);
+  }
+  loadUsers(); // re-read either way: on failure this undoes the optimistic UI
+}
+
+function resetPassword(u) {
+  passwordDialog({
+    title: `Reset password for "${u.username}"`,
+    submitLabel: 'Reset password',
+    fields: [
+      { key: 'password', label: 'New password', hint: PASSWORD_POLICY.description },
+      { key: 'confirm', label: 'Repeat new password' },
+    ],
+    async onSubmit({ password, confirm }) {
+      if (password !== confirm) throw new Error('The two passwords do not match.');
+      // Not saveUser(): that swallows the error into the page banner, and here
+      // the dialog needs it back to keep itself open.
+      await api(`/api/users/${encodeURIComponent(u.username)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      loadUsers();
+      alert(`${u.username} is signed out everywhere and must set a new password at next sign-in.`);
+    },
+  });
+}
+
+async function deleteUser(u) {
+  if (!confirm(`Delete "${u.username}"? They are signed out immediately.`)) return;
+  userError('');
+  try {
+    await api(`/api/users/${encodeURIComponent(u.username)}`, { method: 'DELETE' });
+  } catch (e) {
+    userError(e.message);
+  }
+  loadUsers();
+}
+
+function showUserForm() {
+  const box = $('#userForm');
+  box.classList.remove('hidden');
+  box.innerHTML = '';
+  userError('');
+
+  const name = el('input', { type: 'text', placeholder: 'e.g. jane' });
+  const pass = el('input', {
+    type: 'password',
+    autocomplete: 'new-password',
+    placeholder: `at least ${PASSWORD_POLICY.minLength} characters`,
+  });
+  const role = el('select', {}, ...USERS.roles.map((r) => el('option', { value: r }, r)));
+  role.value = 'tester';
+
+  const hint = el('p', { class: 'muted-note' });
+  function updateHint() {
+    const granted = USERS.permissions.filter((p) => (USERS.roleDefaults[role.value] || {})[p]);
+    hint.textContent = role.value === 'admin'
+      ? 'Admins can do everything, including managing users.'
+      : granted.length
+        ? 'Grants: ' + granted.map((p) => PERM_LABELS[p] || p).join(', ') + '. Fine-tune after creating.'
+        : 'View-only: sees the tree, live runs, history and reports, but changes nothing.';
+  }
+  role.addEventListener('change', updateHint);
+
+  box.append(
+    el('div', { class: 'row' },
+      el('div', {}, el('label', {}, 'Username'), name),
+      el('div', {}, el('label', {}, 'Password'), pass),
+      el('div', {}, el('label', {}, 'Role'), role)),
+    hint,
+    el('div', { class: 'actions' },
+      el('button', { class: 'primary', onclick: save }, 'Create user'),
+      el('button', { class: 'ghost', onclick: () => box.classList.add('hidden') }, 'Cancel'))
+  );
+  updateHint();
+  name.focus();
+
+  async function save() {
+    userError('');
+    try {
+      await api('/api/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: name.value.trim(),
+          password: pass.value,
+          role: role.value,
+        }),
+      });
+      box.classList.add('hidden');
+      loadUsers();
+      alert(
+        `Give ${name.value.trim()} this password over a channel you trust. ` +
+          'They will be asked to replace it the first time they sign in.'
+      );
+    } catch (e) {
+      userError(e.message);
+    }
+  }
+}
+
+$('#btnNewUser').addEventListener('click', showUserForm);
+
+/* --------------------------------- account --------------------------------- */
+
+function renderUserChip() {
+  const chip = $('#userChip');
+  chip.innerHTML = '';
+  chip.append(
+    el('span', { class: 'user-chip-name', title: `Signed in as ${ME.username}` }, ME.username),
+    el('span', { class: 'user-chip-role' }, ME.role),
+    // Wrapped, not passed directly: the click event would arrive as `forced`.
+    el('button', { class: 'ghost sm', onclick: () => changeMyPassword() }, 'Password'),
+    el('button', { class: 'ghost sm', onclick: logout }, 'Log out'));
+}
+
+/**
+ * @param {boolean} forced When the account is flagged `mustChangePassword` the
+ *   server refuses every other API call, so the dialog has no cancel button —
+ *   there is nothing else the session can do until this succeeds.
+ */
+function changeMyPassword(forced = false) {
+  passwordDialog({
+    title: forced
+      ? 'Set your own password before continuing'
+      : 'Change your password',
+    submitLabel: 'Change password',
+    dismissible: !forced,
+    fields: [
+      {
+        key: 'currentPassword',
+        label: 'Current password',
+        hint: forced ? 'The password you were given to sign in with.' : undefined,
+      },
+      { key: 'newPassword', label: 'New password', hint: PASSWORD_POLICY.description },
+      { key: 'confirm', label: 'Repeat new password' },
+    ],
+    async onSubmit({ currentPassword, newPassword, confirm }) {
+      if (newPassword !== confirm) throw new Error('The two new passwords do not match.');
+      await api('/api/auth/password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      ME.mustChangePassword = false;
+      if (forced) location.reload(); // the rest of the app was locked out until now
+      else alert('Password changed. Your other devices have been signed out.');
+    },
+  });
+}
+
+async function logout() {
+  try { await fetch('/api/auth/logout', { method: 'POST' }); } catch (_) {}
+  location.replace('/login.html');
+}
+
+/**
+ * Hide the controls this account may not use. This is cosmetic — the server
+ * checks every mutating route independently — but a viewer shouldn't be shown
+ * buttons that only ever return 403.
+ */
+function applyPermissions() {
+  const tab = (name) => $(`.tab[data-tab="${name}"]`);
+  const toggle = (node, shown) => node && node.classList.toggle('hidden', !shown);
+
+  toggle($('#btnRun'), can('tests.run'));
+  toggle(tab('schedules'), can('schedules.manage'));
+  toggle($('#btnNewSchedule'), can('schedules.manage'));
+  toggle(tab('prbuilder'), can('prbuilder.use'));
+  toggle(tab('sites'), can('sites.manage'));
+  toggle($('#btnNewSite'), can('sites.manage'));
+  toggle(tab('users'), can('users.manage'));
+
+  // Landing on a tab you can no longer see (a bookmark, a demotion) is
+  // disorienting; fall back to Run, which everyone can at least look at.
+  const active = $('.tab.active');
+  if (!active || active.classList.contains('hidden')) showTab('run');
+}
+
 /* --------------------------------- startup --------------------------------- */
 
 async function init() {
+  // Who are we? Everything else — which tabs exist, which buttons render —
+  // hangs off the answer, so this comes before the first data fetch.
+  try {
+    const { user, passwordPolicy } = await api('/api/auth/me');
+    if (!user) return void location.replace('/login.html');
+    ME = user;
+    if (passwordPolicy) PASSWORD_POLICY = passwordPolicy;
+  } catch (_) {
+    return void location.replace('/login.html');
+  }
+  renderUserChip();
+  applyPermissions();
+
+  // The server refuses every other API call while this flag is set, so there
+  // is no point loading a dashboard behind the dialog — stop here.
+  if (ME.mustChangePassword) {
+    changeMyPassword(true);
+    return;
+  }
+
   try {
     const env = await api('/api/env');
     const bad = env.suites.filter((s) => !s.ok);

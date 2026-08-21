@@ -3,6 +3,73 @@
 All notable changes to the dashboard (the local web UI that runs Playwright
 suites across configured sites).
 
+## 2026-08-20 — Security hardening
+
+An audit of how the dashboard stores user accounts and site passwords, ahead of
+open-sourcing it. Everything below is fixed; the through-line is that the app now
+assumes it may be hosted on a public domain rather than sitting on one laptop.
+
+### Privilege escalation: environment injection into spawned processes
+
+`POST /api/runs` passed the request body straight through to `spawn()`, so any
+account with `tests.run` could set `NODE_OPTIONS=--require …` (or
+`CYPRESS_RUN_BINARY`, `PATH`, `LD_PRELOAD`) and execute arbitrary code as the
+dashboard's user. Saved schedules were the same hole with a timer on it.
+Requested environment is now allowlisted to the `E2E_ / WP_ / TEST_ /
+DASHBOARD_` namespaces, and validated when a schedule is saved rather than at
+3am when it fires. A run may also no longer carry its own `baseUrl`: only the
+PR Builder, which builds its target server-side, can target an unregistered site.
+
+### Site passwords are encrypted at rest
+
+`data/custom-sites.json` held `"adminPass": "admin"` in the clear. It is now
+AES-256-GCM, keyed from `DASHBOARD_SECRET_KEY` or a generated `data/secret.key`
+(0600), and existing files are migrated on first boot. `data/` itself is locked
+to the running account. Adding a site now *requires* a password — the old
+silent default meant a site with none would send admin/admin at whatever host
+its URL pointed to.
+
+### Bound to loopback by default
+
+`app.listen(PORT)` bound every interface while the banner said `localhost`, over
+plain HTTP with non-Secure cookies. Now `127.0.0.1` unless `HOST` says otherwise,
+with `TRUST_PROXY` to make `req.secure` and `req.ip` meaningful behind a proxy
+and a boot warning when the bind is not loopback.
+
+### Path traversal in run and target ids
+
+Express percent-decodes route parameters after matching, so `..%2f..%2f` reached
+`path.join()` in the report, artifact and run-record routes. Both ids are now
+validated before they touch the filesystem.
+
+### Accounts
+
+- The seeded admin gets a **generated** password, printed once, instead of the
+  published constant `admin!`.
+- `mustChangePassword` is enforced rather than advisory: the account is signed in
+  but inert until it sets its own password. New accounts and admin resets set it.
+- Password floor raised to 12 characters, with checks against the username and a
+  short list of the obvious ones.
+- scrypt cost raised to 32 MiB with the parameters stored per record, so it can be
+  raised again later; a successful sign-in re-hashes older records transparently.
+- Unknown usernames now cost the same work as wrong passwords — the previous
+  early return leaked which accounts exist through response timing.
+- Throttling is per account **and** per client address, escalating, and no longer
+  hands back a clean slate when a lock expires. The maps are bounded.
+- Session ids are stored as SHA-256 digests, with an absolute 7-day cap on top of
+  the sliding idle timeout.
+
+### Browser-side
+
+- Strict CSP (no external origins), `nosniff`, `X-Frame-Options: DENY`, HSTS over
+  TLS. The login page's inline script moved to `login.js` so `script-src` can be
+  `'self'`. Playwright reports get a narrowly relaxed policy so they still run.
+- Same-origin check on every state-changing request, behind `SameSite=Lax`.
+- Artifacts that a browser would execute (`.html`, `.svg`, `.xml`) are served as
+  downloads — they are test output from sites you may not control.
+- Passwords are typed into a real masked dialog instead of `window.prompt()`,
+  which paints them onto the screen.
+
 ## 2026-07-08 — Run pacing, per-site control, and a combined report
 
 Three problems surfaced running the full 11-product suite from the dashboard, plus

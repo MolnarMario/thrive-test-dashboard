@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sign in · Automation Test Platform</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body class="login-body">
+    <main class="login-card">
+      <div class="login-brand">
+        <span class="brand-mark">
+          <svg viewBox="0 0 60 60" role="img" aria-label="Automation Test Platform">
+            <circle cx="30" cy="30" r="28" fill="var(--accent)" />
+            <path d="M18 31l8 8 16-17" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </span>
+        <span class="brand-text">
+          <span class="brand-title">Automation Test Platform</span>
+          <span class="brand-sub">Sign in to continue</span>
+        </span>
+      </div>
+
+      <div id="loginError" class="error-banner hidden"></div>
+
+      <form id="loginForm" autocomplete="on">
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" autofocus required />
+
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required />
+
+        <button id="loginBtn" class="primary" type="submit">Sign in</button>
+      </form>
+
+      <p class="muted-note login-note">
+        Ask an administrator for an account. Sessions last 12 hours.
+      </p>
+    </main>
+
+    <script src="login.js"></script>
+  </body>
+</html>

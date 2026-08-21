@@ -27,8 +27,11 @@
         <button class="tab" data-tab="calendar">Calendar</button>
         <button class="tab" data-tab="schedules">Schedules</button>
         <button class="tab" data-tab="prbuilder">PR Builder</button>
+        <button class="tab hidden" data-tab="sites">Sites</button>
+        <button class="tab hidden" data-tab="users">Users</button>
       </nav>
       <div class="env" id="envInfo"></div>
+      <div class="user-chip" id="userChip"></div>
     </header>
 
     <main>
@@ -41,7 +44,6 @@
             <button id="btnClear" class="ghost">Clear selection</button>
             <button id="btnRefreshTree" class="ghost" title="Rescan suite for specs">↻ Rescan</button>
             <button id="btnCheckSites" class="ghost" title="Ping LocalWP sites">◎ Check sites</button>
-            <button id="btnAddSite" class="ghost">+ Add site</button>
           </div>
           <div class="right">
             <input id="grepInput" type="text" placeholder="Filter by keyword, optional" />
@@ -49,7 +51,6 @@
             <button id="btnRun" class="primary" disabled>Run selected ▶</button>
           </div>
         </div>
-        <div id="siteForm" class="sched-form hidden"></div>
         <div id="grepHint" class="warn-banner hidden"></div>
         <div id="runError" class="error-banner hidden"></div>
         <div id="tree" class="tree">Loading test tree…</div>
@@ -173,6 +174,38 @@
 
         <h3 class="prb-history-head">Recent builds</h3>
         <div id="prbHistory" class="history-list">Loading…</div>
+      </section>
+
+      <!-- SITES TAB (admins only) -->
+      <section id="tab-sites" class="tabpane">
+        <div class="sched-head">
+          <h3>Sites</h3>
+          <button id="btnNewSite" class="primary">+ New site</button>
+        </div>
+        <p class="muted-note">
+          Sites are the environments test suites run against — add one here and
+          it's selectable from every suite's dropdown right away. Sites defined
+          in sites.config.json are read-only here; edit that file to change them.
+        </p>
+        <div id="siteError" class="error-banner hidden"></div>
+        <div id="siteForm" class="sched-form hidden"></div>
+        <div id="siteList" class="sched-list">Loading…</div>
+      </section>
+
+      <!-- USERS TAB (admins only) -->
+      <section id="tab-users" class="tabpane">
+        <div class="sched-head">
+          <h3>Users &amp; access</h3>
+          <button id="btnNewUser" class="primary">+ New user</button>
+        </div>
+        <p class="muted-note">
+          A role sets the defaults; tick or untick a box to grant or revoke one
+          permission for that person on top of it. Everyone signed in can always
+          view the tree, live runs, history and reports.
+        </p>
+        <div id="userError" class="error-banner hidden"></div>
+        <div id="userForm" class="sched-form hidden"></div>
+        <div id="userList" class="sched-list">Loading…</div>
       </section>
     </main>
 

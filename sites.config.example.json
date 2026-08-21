@@ -2,47 +2,34 @@
   "//": [
     "Copy this file to sites.config.json and edit it.",
     "",
-    "Two independent lists; the run matrix is their product.",
+    "This file only declares suites — HOW tests run: a directory plus which",
+    "framework it uses ('playwright' for *.spec.ts, 'cypress' for *.cy.ts, or",
+    "'selenium' for Java *Test.java via Maven Surefire). Omit 'framework' to",
+    "auto-detect from the files on disk.",
     "",
-    "  sites  — WHERE tests run. A URL plus the admin credentials to use.",
-    "           Every suite is handed these as E2E_BASE_URL / E2E_ADMIN_USER /",
-    "           E2E_ADMIN_PASS, so a suite that reads those can be pointed at",
-    "           any registered site from the dashboard's dropdown.",
+    "Sites — WHERE tests run, a URL plus the admin credentials to use — are",
+    "no longer configured here. Add, edit and remove them from the admin",
+    "Sites tab in the dashboard once it's running; every suite is then handed",
+    "the chosen site as E2E_BASE_URL / E2E_ADMIN_USER / E2E_ADMIN_PASS.",
+    "Sites added that way have their password encrypted at rest — see the",
+    "README's 'Site credentials' section.",
     "",
-    "  suites — HOW tests run. A directory plus which framework it uses:",
-    "           'playwright' (*.spec.ts), 'cypress' (*.cy.ts) or",
-    "           'selenium' (Java, *Test.java via Maven Surefire).",
-    "           Omit 'framework' to auto-detect from the files on disk.",
+    "If you do declare a site here, keep its password out of this file: use",
+    "'adminPassEnv' to name an environment variable to read it from, e.g.",
+    "  \"sites\": { \"staging\": { \"url\": \"https://staging.example.com\",",
+    "                          \"adminUser\": \"admin\",",
+    "                          \"adminPassEnv\": \"STAGING_WP_PASS\" } }",
+    "This file is meant to be shareable; a plaintext password in it is not.",
     "",
     "Optional per-suite keys:",
     "  sites        — restrict which sites this suite may target (default: all)",
-    "  defaultSite  — the site preselected in the dropdown",
+    "  defaultSite  — the site preselected in the dropdown; must match a site",
+    "                 key you've added from the Sites tab",
     "  env          — extra environment variables for this suite's runs",
     "  scopes       — split one suite into separately selectable slices, each",
     "                 with its own default site (for a suite whose specs are",
     "                 organised per product/tenant). See the example below."
   ],
-
-  "sites": {
-    "site-a": {
-      "name": "Site A",
-      "url": "https://site-a.local",
-      "adminUser": "admin",
-      "adminPass": "admin"
-    },
-    "site-b": {
-      "name": "Site B",
-      "url": "https://site-b.local",
-      "adminUser": "admin",
-      "adminPass": "admin"
-    },
-    "staging": {
-      "name": "Staging",
-      "url": "https://staging.example.com",
-      "adminUser": "admin",
-      "adminPass": "change-me"
-    }
-  },
 
   "suites": {
     "e2e-playwright": {
