@@ -128,6 +128,14 @@ async function api(path, opts) {
     await new Promise(() => {}); // never settles; the navigation takes over
   }
   const data = await res.json().catch(() => ({}));
+  // An account still on a password somebody else chose is signed in but inert
+  // until it sets its own. Any call can be the one that discovers this — a tab
+  // left open across an admin's password reset, say.
+  if (res.status === 403 && data.mustChangePassword) {
+    if (ME) ME.mustChangePassword = true;
+    changeMyPassword(true);
+    await new Promise(() => {}); // the dialog owns the session from here
+  }
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
 }
@@ -136,6 +144,79 @@ async function api(path, opts) {
 
 /** The signed-in user, as /api/auth/me described them. Set once, in init(). */
 let ME = null;
+
+/** The server's password rules, so every field can state them before you type. */
+let PASSWORD_POLICY = { minLength: 12, description: 'At least 12 characters.' };
+
+/**
+ * Ask for one or more passwords in a modal with real password fields.
+ *
+ * Replaces window.prompt(), which renders what you type in plain text on
+ * screen, offers no confirmation field, and can't be dismissed conditionally —
+ * all three of which matter when the thing being typed is a credential.
+ *
+ * @param {{title: string, fields: {key: string, label: string, hint?: string}[],
+ *          submitLabel?: string, dismissible?: boolean,
+ *          onSubmit: (values: object) => Promise<void>}} opts
+ */
+let passwordDialogOpen = false;
+
+function passwordDialog(opts) {
+  // Several in-flight calls can each come back with the same 403; one dialog
+  // is the answer to all of them.
+  if (passwordDialogOpen) return;
+  passwordDialogOpen = true;
+
+  const inputs = new Map();
+  const errBox = el('div', { class: 'modal-error hidden' });
+
+  const rows = opts.fields.map((f) => {
+    const input = el('input', { type: 'password', autocomplete: 'new-password' });
+    inputs.set(f.key, input);
+    return el('div', { class: 'pw-field' },
+      el('label', {}, f.label),
+      input,
+      f.hint ? el('p', { class: 'muted-note' }, f.hint) : null);
+  });
+
+  const submit = el('button', { class: 'primary', onclick: run }, opts.submitLabel || 'Save');
+  const panel = el('div', { class: 'modal pw-modal' },
+    el('div', { class: 'modal-head' }, el('div', { class: 'modal-title' }, opts.title)),
+    el('div', { class: 'pw-form' }, errBox, ...rows),
+    el('div', { class: 'modal-footer pw-actions' },
+      submit,
+      opts.dismissible === false
+        ? null
+        : el('button', { class: 'ghost', onclick: close }, 'Cancel')));
+
+  const overlay = el('div', { class: 'modal-overlay' }, panel);
+  document.body.append(overlay);
+  inputs.values().next().value.focus();
+
+  for (const input of inputs.values()) {
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') run(); });
+  }
+
+  function close() {
+    overlay.remove();
+    passwordDialogOpen = false;
+  }
+
+  async function run() {
+    errBox.classList.add('hidden');
+    const values = {};
+    for (const [key, input] of inputs) values[key] = input.value;
+    submit.disabled = true;
+    try {
+      await opts.onSubmit(values);
+      close();
+    } catch (e) {
+      errBox.textContent = e.message;
+      errBox.classList.remove('hidden');
+      submit.disabled = false;
+    }
+  }
+}
 
 /** Does the signed-in user hold this permission? Viewing needs none. */
 function can(permission) {
@@ -854,7 +935,7 @@ function showAddSiteForm() {
   const name = el('input', { type: 'text', placeholder: 'e.g. Staging' });
   const url = el('input', { type: 'text', placeholder: 'https://staging.example.com' });
   const user = el('input', { type: 'text', placeholder: 'admin', value: 'admin' });
-  const pass = el('input', { type: 'password', placeholder: 'admin' });
+  const pass = el('input', { type: 'password', autocomplete: 'new-password', placeholder: 'required' });
 
   const save = el('button', { class: 'primary' }, 'Add site');
   save.addEventListener('click', async () => {
@@ -882,6 +963,9 @@ function showAddSiteForm() {
     el('div', { class: 'row' },
       el('div', {}, el('label', {}, 'Admin username'), user),
       el('div', {}, el('label', {}, 'Admin password'), pass)),
+    el('p', { class: 'muted-note' },
+      'Stored encrypted on the server and never sent back to the browser. ' +
+      'Runs need it to sign in to the site, so it cannot be hashed.'),
     el('div', { class: 'actions' }, save, cancel));
   name.focus();
 }
@@ -2426,10 +2510,27 @@ async function saveUser(username, patch) {
   loadUsers(); // re-read either way: on failure this undoes the optimistic UI
 }
 
-async function resetPassword(u) {
-  const pw = prompt(`New password for "${u.username}":`);
-  if (!pw) return;
-  await saveUser(u.username, { password: pw });
+function resetPassword(u) {
+  passwordDialog({
+    title: `Reset password for "${u.username}"`,
+    submitLabel: 'Reset password',
+    fields: [
+      { key: 'password', label: 'New password', hint: PASSWORD_POLICY.description },
+      { key: 'confirm', label: 'Repeat new password' },
+    ],
+    async onSubmit({ password, confirm }) {
+      if (password !== confirm) throw new Error('The two passwords do not match.');
+      // Not saveUser(): that swallows the error into the page banner, and here
+      // the dialog needs it back to keep itself open.
+      await api(`/api/users/${encodeURIComponent(u.username)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      loadUsers();
+      alert(`${u.username} is signed out everywhere and must set a new password at next sign-in.`);
+    },
+  });
 }
 
 async function deleteUser(u) {
@@ -2450,7 +2551,11 @@ function showUserForm() {
   userError('');
 
   const name = el('input', { type: 'text', placeholder: 'e.g. jane' });
-  const pass = el('input', { type: 'text', placeholder: 'at least 5 characters' });
+  const pass = el('input', {
+    type: 'password',
+    autocomplete: 'new-password',
+    placeholder: `at least ${PASSWORD_POLICY.minLength} characters`,
+  });
   const role = el('select', {}, ...USERS.roles.map((r) => el('option', { value: r }, r)));
   role.value = 'tester';
 
@@ -2492,6 +2597,10 @@ function showUserForm() {
       });
       box.classList.add('hidden');
       loadUsers();
+      alert(
+        `Give ${name.value.trim()} this password over a channel you trust. ` +
+          'They will be asked to replace it the first time they sign in.'
+      );
     } catch (e) {
       userError(e.message);
     }
@@ -2508,26 +2617,44 @@ function renderUserChip() {
   chip.append(
     el('span', { class: 'user-chip-name', title: `Signed in as ${ME.username}` }, ME.username),
     el('span', { class: 'user-chip-role' }, ME.role),
-    el('button', { class: 'ghost sm', onclick: changeMyPassword }, 'Password'),
+    // Wrapped, not passed directly: the click event would arrive as `forced`.
+    el('button', { class: 'ghost sm', onclick: () => changeMyPassword() }, 'Password'),
     el('button', { class: 'ghost sm', onclick: logout }, 'Log out'));
 }
 
-async function changeMyPassword() {
-  const currentPassword = prompt('Your current password:');
-  if (!currentPassword) return;
-  const newPassword = prompt('New password (at least 5 characters):');
-  if (!newPassword) return;
-  try {
-    await api('/api/auth/password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ currentPassword, newPassword }),
-    });
-    ME.mustChangePassword = false;
-    alert('Password changed. Your other devices have been signed out.');
-  } catch (e) {
-    alert(e.message);
-  }
+/**
+ * @param {boolean} forced When the account is flagged `mustChangePassword` the
+ *   server refuses every other API call, so the dialog has no cancel button —
+ *   there is nothing else the session can do until this succeeds.
+ */
+function changeMyPassword(forced = false) {
+  passwordDialog({
+    title: forced
+      ? 'Set your own password before continuing'
+      : 'Change your password',
+    submitLabel: 'Change password',
+    dismissible: !forced,
+    fields: [
+      {
+        key: 'currentPassword',
+        label: 'Current password',
+        hint: forced ? 'The password you were given to sign in with.' : undefined,
+      },
+      { key: 'newPassword', label: 'New password', hint: PASSWORD_POLICY.description },
+      { key: 'confirm', label: 'Repeat new password' },
+    ],
+    async onSubmit({ currentPassword, newPassword, confirm }) {
+      if (newPassword !== confirm) throw new Error('The two new passwords do not match.');
+      await api('/api/auth/password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword, newPassword }),
+      });
+      ME.mustChangePassword = false;
+      if (forced) location.reload(); // the rest of the app was locked out until now
+      else alert('Password changed. Your other devices have been signed out.');
+    },
+  });
 }
 
 async function logout() {
@@ -2564,16 +2691,21 @@ async function init() {
   // Who are we? Everything else — which tabs exist, which buttons render —
   // hangs off the answer, so this comes before the first data fetch.
   try {
-    const { user } = await api('/api/auth/me');
+    const { user, passwordPolicy } = await api('/api/auth/me');
     if (!user) return void location.replace('/login.html');
     ME = user;
+    if (passwordPolicy) PASSWORD_POLICY = passwordPolicy;
   } catch (_) {
     return void location.replace('/login.html');
   }
   renderUserChip();
   applyPermissions();
+
+  // The server refuses every other API call while this flag is set, so there
+  // is no point loading a dashboard behind the dialog — stop here.
   if (ME.mustChangePassword) {
-    alert(`You are signed in with the default password for "${ME.username}". Please change it now — use the Password button in the top bar.`);
+    changeMyPassword(true);
+    return;
   }
 
   try {

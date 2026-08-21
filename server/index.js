@@ -5,7 +5,7 @@ const fs = require('fs');
 const express = require('express');
 
 const config = require('../config');
-const { PORT, RUNS_DIR, SUITES, SITES } = config;
+const { PORT, HOST, TRUST_PROXY, RUNS_DIR, SUITES, SITES } = config;
 const frameworks = require('./frameworks');
 const store = require('./store');
 const tree = require('./tree');
@@ -17,42 +17,118 @@ const prbuilder = require('./prbuilder');
 const auth = require('./auth');
 
 const app = express();
+
+// Only meaningful behind a reverse proxy, and actively harmful without one:
+// with it on, anyone can forge X-Forwarded-For (defeating per-client login
+// throttling) and X-Forwarded-Proto (defeating the Secure cookie flag).
+if (TRUST_PROXY) {
+  app.set('trust proxy', /^\d+$/.test(TRUST_PROXY) ? Number(TRUST_PROXY) : TRUST_PROXY);
+}
+app.disable('x-powered-by');
+
 app.use(express.json({ limit: '2mb' }));
 
-/* --------------------------------- auth ---------------------------------- */
-// Order matters: hydrate the session, expose the handful of endpoints a signed
-// -out browser needs, then close the gate. Everything below it — API routes,
-// static files, reports, SSE — requires a session.
+/* ------------------------------ base headers ------------------------------ */
 
+/**
+ * Applied to everything, including the reports and artifacts served further
+ * down. The CSP here is the app's own: no external origins at all, so a script
+ * that does get injected has nowhere to send what it reads. Report pages
+ * relax it slightly (see reportCsp) because Playwright's HTML report is a
+ * bundled app that needs inline script to run.
+ */
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
+      "img-src 'self' data:; font-src 'self' data:; connect-src 'self'; " +
+      "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+  );
+  // Only meaningful over TLS, and only safe to send there: on a plain-HTTP
+  // install this would pin a scheme that doesn't exist.
+  if (req.secure) {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+
+/* ----------------------------- path parameters ---------------------------- */
+
+/**
+ * Every id below is pasted straight into a filesystem path, and Express
+ * percent-decodes route parameters *after* matching — so `:id` happily arrives
+ * as `../../something` if the client sent `..%2f..%2fsomething`. That turns a
+ * report link into a file browser for the whole disk.
+ *
+ * The ids this app actually mints are timestamps, slugs and target keys, so
+ * one conservative pattern covers all of them, and anything else is a 400
+ * before it reaches path.join().
+ */
+const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+function safeParams(...names) {
+  return (req, res, next) => {
+    for (const name of names) {
+      const value = req.params[name];
+      if (typeof value !== 'string' || !SAFE_SEGMENT.test(value) || value.includes('..')) {
+        return res.status(400).json({ error: `Invalid ${name}.` });
+      }
+    }
+    next();
+  };
+}
+
+/* --------------------------------- auth ---------------------------------- */
+// Order matters: reject cross-site writes, hydrate the session, expose the
+// handful of endpoints a signed-out browser needs, then close the gate.
+// Everything below it — API routes, static files, reports, SSE — requires a
+// session, and an account still on an assigned password can only change it.
+
+app.use(auth.sameOriginOnly);
 app.use(auth.attachUser);
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body || {};
-  const result = auth.login(username, password);
-  if (!result.ok) return res.status(result.status).json({ error: result.error });
-  auth.setSessionCookie(res, result.sid);
-  res.json({ user: auth.publicUser(result.user) });
+  try {
+    const result = await auth.login(username, password, req.ip);
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
+    auth.setSessionCookie(req, res, result.sid);
+    res.json({ user: auth.publicUser(result.user) });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  }
 });
 
 app.post('/api/auth/logout', (req, res) => {
   auth.logout(req.sessionId);
-  auth.clearSessionCookie(res);
+  auth.clearSessionCookie(req, res);
   res.json({ ok: true });
 });
 
 // The frontend's single source of truth for what to render. Public so the app
-// can ask "am I signed in?" without provoking a 401 in the console.
+// can ask "am I signed in?" without provoking a 401 in the console. The policy
+// rides along so every password field can state the rules before you type.
 app.get('/api/auth/me', (req, res) => {
-  res.json({ user: req.user ? auth.publicUser(req.user) : null });
+  res.json({
+    user: req.user ? auth.publicUser(req.user) : null,
+    passwordPolicy: auth.passwordPolicy,
+  });
 });
 
 app.use(auth.gate);
+app.use(auth.requirePasswordChange);
 
 // Change your own password. Signs out this account's other sessions.
-app.post('/api/auth/password', (req, res) => {
+app.post('/api/auth/password', async (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
   try {
-    res.json({ user: auth.changePassword(req.user, currentPassword, newPassword, req.sessionId) });
+    res.json({
+      user: await auth.changePassword(req.user, currentPassword, newPassword, req.sessionId),
+    });
   } catch (err) {
     res.status(400).json({ error: String(err.message || err) });
   }
@@ -64,23 +140,23 @@ app.get('/api/users', auth.requirePermission('users.manage'), (_req, res) => {
   res.json({ users: auth.listUsers(), roles: auth.ROLES, permissions: auth.PERMISSIONS, roleDefaults: auth.ROLE_DEFAULTS });
 });
 
-app.post('/api/users', auth.requirePermission('users.manage'), (req, res) => {
+app.post('/api/users', auth.requirePermission('users.manage'), async (req, res) => {
   try {
-    res.status(201).json({ user: auth.createUser(req.body || {}, req.user) });
+    res.status(201).json({ user: await auth.createUser(req.body || {}, req.user) });
   } catch (err) {
     res.status(400).json({ error: String(err.message || err) });
   }
 });
 
-app.patch('/api/users/:username', auth.requirePermission('users.manage'), (req, res) => {
+app.patch('/api/users/:username', auth.requirePermission('users.manage'), async (req, res) => {
   try {
-    res.json({ user: auth.updateUser(req.params.username, req.body || {}, req.user) });
+    res.json({ user: await auth.updateUser(req.params.username, req.body || {}, req.user) });
   } catch (err) {
     res.status(400).json({ error: String(err.message || err) });
   }
 });
 
-app.delete('/api/users/:username', auth.requirePermission('users.manage'), (req, res) => {
+app.delete('/api/users/:username', safeParams('username'), auth.requirePermission('users.manage'), (req, res) => {
   try {
     res.json(auth.deleteUser(req.params.username, req.user));
   } catch (err) {
@@ -125,7 +201,7 @@ app.get('/api/active', (_req, res) => {
 // Single run detail. While running, return the live snapshot; once finished,
 // prefer the persisted record (it carries the full per-test arrays that the
 // slim live snapshot omits — even during the brief post-run lingering window).
-app.get('/api/runs/:id', (req, res) => {
+app.get('/api/runs/:id', safeParams('id'), (req, res) => {
   const live = orchestrator.getActiveSnapshot(req.params.id);
   if (live && live.status === 'running') {
     return res.json({ run: live, live: true });
@@ -137,7 +213,7 @@ app.get('/api/runs/:id', (req, res) => {
 });
 
 // Cancel a run.
-app.post('/api/runs/:id/cancel', auth.requirePermission('tests.run'), (req, res) => {
+app.post('/api/runs/:id/cancel', safeParams('id'), auth.requirePermission('tests.run'), (req, res) => {
   const ok = orchestrator.cancelRun(req.params.id);
   res.status(ok ? 202 : 404).json({ cancelling: ok });
 });
@@ -145,13 +221,13 @@ app.post('/api/runs/:id/cancel', auth.requirePermission('tests.run'), (req, res)
 // Cancel a single target within a run (kills just that target's process,
 // frees it). `:target` is the "<suite>__<site>" key; a bare site key is still
 // accepted so older links keep working.
-app.post('/api/runs/:id/targets/:target/cancel', auth.requirePermission('tests.run'), (req, res) => {
+app.post('/api/runs/:id/targets/:target/cancel', safeParams('id', 'target'), auth.requirePermission('tests.run'), (req, res) => {
   const ok = orchestrator.cancelTarget(req.params.id, req.params.target);
   res.status(ok ? 202 : 404).json({ cancelling: ok });
 });
 
 // Live progress via Server-Sent Events.
-app.get('/api/runs/:id/stream', (req, res) => {
+app.get('/api/runs/:id/stream', safeParams('id'), (req, res) => {
   const id = req.params.id;
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -198,19 +274,36 @@ app.get('/api/runs/:id/stream', (req, res) => {
 
 // One combined HTML report merging every product of a run into a single page
 // (printable to PDF via Ctrl+P). Built on demand from the persisted run.json.
-app.get('/api/runs/:id/combined-report', (req, res) => {
+app.get('/api/runs/:id/combined-report', safeParams('id'), (req, res) => {
   const run = store.loadRun(req.params.id);
   if (!run) return res.status(404).send('Run not found.');
   res.type('html').send(buildCombinedReportHtml(run));
 });
 
-// Serve a target's Playwright HTML report (drill-down to traces/screenshots).
-// Only Playwright produces one; the other frameworks expose /artifacts instead.
-app.use('/api/runs/:id/report/:target', (req, res, next) => {
+/**
+ * Serve a target's Playwright HTML report (drill-down to traces/screenshots).
+ * Only Playwright produces one; the other frameworks expose /artifacts instead.
+ *
+ * The report is a self-contained app whose script and data are inlined, so the
+ * strict app CSP would stop it dead — it gets its own, relaxed exactly as far
+ * as it needs and no further. What stays locked is the network: no origin but
+ * this one appears anywhere, so nothing a report renders can call home. That
+ * matters because a report renders *test output*, which is attacker-influenced
+ * whenever a suite touches a site you don't control.
+ */
+const REPORT_CSP =
+  "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; " +
+  "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; " +
+  "font-src 'self' data:; media-src 'self' data: blob:; " +
+  "connect-src 'self' data: blob:; worker-src 'self' blob:; " +
+  "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+app.use('/api/runs/:id/report/:target', safeParams('id', 'target'), (req, res, next) => {
   const dir = path.join(RUNS_DIR, req.params.id, `${req.params.target}-report`);
   if (!fs.existsSync(dir)) {
     return res.status(404).send('No report for this target.');
   }
+  res.setHeader('Content-Security-Policy', REPORT_CSP);
   express.static(dir)(req, res, next);
 });
 
@@ -220,7 +313,7 @@ app.use('/api/runs/:id/report/:target', (req, res, next) => {
  * generated report — the framework didn't produce one, and inventing a fancier
  * view would only hide what's actually there.
  */
-app.get('/api/runs/:id/artifacts/:target', (req, res) => {
+app.get('/api/runs/:id/artifacts/:target', safeParams('id', 'target'), (req, res) => {
   const root = path.join(RUNS_DIR, req.params.id, `${req.params.target}-artifacts`);
   if (!fs.existsSync(root)) return res.status(404).send('No artifacts for this target.');
 
@@ -251,10 +344,35 @@ li span{color:#5b6472;font-size:12px;margin-left:auto}a{color:#1667c2;text-decor
 <h1>Artifacts · ${esc(req.params.target)}</h1><ul>${rows}</ul></body></html>`);
 });
 
-app.use('/api/runs/:id/artifacts/:target/file', (req, res, next) => {
+/**
+ * Raw artifact files. Unlike the Playwright report these are not an app we
+ * ship — they are whatever a framework dropped on disk after driving a site,
+ * which is to say: content this dashboard did not write and cannot vouch for.
+ *
+ * So anything a browser would *execute* is handed over as a download instead
+ * of rendered: an HTML or SVG artifact rendered inline would run its script
+ * on this origin, with the viewer's session. Screenshots and logs still open
+ * in the tab, which is all anyone wants from them anyway.
+ */
+const NEVER_RENDER = new Set(['.html', '.htm', '.xhtml', '.svg', '.xml', '.xsl', '.mhtml']);
+
+app.use('/api/runs/:id/artifacts/:target/file', safeParams('id', 'target'), (req, res, next) => {
   const root = path.join(RUNS_DIR, req.params.id, `${req.params.target}-artifacts`);
   if (!fs.existsSync(root)) return res.status(404).send('No artifacts for this target.');
-  express.static(root)(req, res, next);
+  express.static(root, {
+    setHeaders(response, filePath) {
+      if (NEVER_RENDER.has(path.extname(filePath).toLowerCase())) {
+        response.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        response.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${path.basename(filePath).replace(/["\\]/g, '')}"`
+        );
+      }
+      // Everything else keeps the strict app-wide CSP set at the top of this
+      // file — which already bans inline script — so a screenshot still
+      // renders in the tab while nothing here can execute.
+    },
+  })(req, res, next);
 });
 
 // Suites, sites and toolchain status — what the UI needs to explain the setup.
@@ -323,7 +441,7 @@ app.post('/api/sites', auth.requirePermission('sites.manage'), (req, res) => {
 
 // Edit a site added through the UI. Sites from sites.config.json can't be
 // edited here — that file stays the source of truth for those.
-app.patch('/api/sites/:key', auth.requirePermission('sites.manage'), (req, res) => {
+app.patch('/api/sites/:key', safeParams('key'), auth.requirePermission('sites.manage'), (req, res) => {
   try {
     const site = config.updateSite(req.params.key, req.body || {});
     res.json({ site: { key: site.key, name: site.name, url: site.url, custom: true } });
@@ -334,7 +452,7 @@ app.patch('/api/sites/:key', auth.requirePermission('sites.manage'), (req, res) 
 
 // Remove a site added through the UI. Sites from sites.config.json can't be
 // removed here — that file stays the source of truth for those.
-app.delete('/api/sites/:key', auth.requirePermission('sites.manage'), (req, res) => {
+app.delete('/api/sites/:key', safeParams('key'), auth.requirePermission('sites.manage'), (req, res) => {
   try {
     config.removeSite(req.params.key);
     res.json({ deleted: true });
@@ -384,7 +502,7 @@ app.post('/api/schedules', auth.requirePermission('schedules.manage'), (req, res
   }
 });
 
-app.put('/api/schedules/:id', auth.requirePermission('schedules.manage'), (req, res) => {
+app.put('/api/schedules/:id', safeParams('id'), auth.requirePermission('schedules.manage'), (req, res) => {
   try {
     res.json({ schedule: scheduler.update(req.params.id, req.body) });
   } catch (err) {
@@ -392,7 +510,7 @@ app.put('/api/schedules/:id', auth.requirePermission('schedules.manage'), (req, 
   }
 });
 
-app.post('/api/schedules/:id/toggle', auth.requirePermission('schedules.manage'), (req, res) => {
+app.post('/api/schedules/:id/toggle', safeParams('id'), auth.requirePermission('schedules.manage'), (req, res) => {
   try {
     res.json({ schedule: scheduler.setEnabled(req.params.id, req.body && req.body.enabled) });
   } catch (err) {
@@ -400,12 +518,12 @@ app.post('/api/schedules/:id/toggle', auth.requirePermission('schedules.manage')
   }
 });
 
-app.post('/api/schedules/:id/run', auth.requirePermission('schedules.manage', 'tests.run'), (req, res) => {
+app.post('/api/schedules/:id/run', safeParams('id'), auth.requirePermission('schedules.manage', 'tests.run'), (req, res) => {
   const result = scheduler.fire(req.params.id);
   res.status(result.ok ? 202 : 409).json(result);
 });
 
-app.delete('/api/schedules/:id', auth.requirePermission('schedules.manage'), (req, res) => {
+app.delete('/api/schedules/:id', safeParams('id'), auth.requirePermission('schedules.manage'), (req, res) => {
   scheduler.remove(req.params.id);
   res.json({ deleted: true });
 });
@@ -442,7 +560,7 @@ app.get('/api/prbuilder/builds', (req, res) => {
   res.json({ builds: prbuilder.listBuilds({ limit: Number(req.query.limit) || 100 }) });
 });
 
-app.get('/api/prbuilder/builds/:id', (req, res) => {
+app.get('/api/prbuilder/builds/:id', safeParams('id'), (req, res) => {
   const active = prbuilder.getActive();
   if (active && active.id === req.params.id) return res.json({ build: active, live: true });
   const build = prbuilder.loadBuild(req.params.id);
@@ -462,8 +580,10 @@ app.post('/api/prbuilder/build', auth.requirePermission('prbuilder.use'), (req, 
 // run (single-site target), so it shows up in Live + History like any run.
 app.post('/api/prbuilder/test', auth.requirePermission('prbuilder.use', 'tests.run'), (req, res) => {
   try {
+    // Trusted: this target is built server-side from the project config, not
+    // from the request body, so it may carry its own URL and credentials.
     const { target, label } = prbuilder.buildTestTarget(req.body || {});
-    const { id } = orchestrator.startRun([target], label);
+    const { id } = orchestrator.startRun([target], label, { trusted: true });
     res.status(201).json({ id });
   } catch (err) {
     const msg = String(err.message || err);
@@ -471,13 +591,13 @@ app.post('/api/prbuilder/test', auth.requirePermission('prbuilder.use', 'tests.r
   }
 });
 
-app.post('/api/prbuilder/builds/:id/cancel', auth.requirePermission('prbuilder.use'), (req, res) => {
+app.post('/api/prbuilder/builds/:id/cancel', safeParams('id'), auth.requirePermission('prbuilder.use'), (req, res) => {
   const ok = prbuilder.cancelBuild(req.params.id);
   res.status(ok ? 202 : 404).json({ cancelling: ok });
 });
 
 // Live build log via SSE (replays the persisted log, then streams live).
-app.get('/api/prbuilder/builds/:id/stream', (req, res) => {
+app.get('/api/prbuilder/builds/:id/stream', safeParams('id'), (req, res) => {
   const id = req.params.id;
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -522,7 +642,6 @@ function localDay(iso) {
 /* ------------------------------- bootstrap -------------------------------- */
 
 store.ensureDir(RUNS_DIR);
-const seededAdmin = auth.init();
 orchestrator.recoverInterrupted();
 prbuilder.recoverInterrupted();
 scheduler.init();
@@ -530,9 +649,18 @@ scheduler.init();
 // tree shows exact "tests that will run" without the first page load waiting.
 tree.getTree().catch(() => {});
 
-app.listen(PORT, () => {
+// auth.init() hashes a password when it seeds the first admin, and hashing is
+// deliberately slow — so the listener waits on it rather than racing it.
+auth.init().then(startListening).catch((err) => {
+  console.error(`\n  Could not initialise authentication: ${err.message}\n`);
+  process.exit(1);
+});
+
+function startListening(seededAdmin) {
+app.listen(PORT, HOST, () => {
   /* eslint-disable no-console */
-  console.log(`\n  Automation Test Platform → http://localhost:${PORT}\n`);
+  const shown = HOST === '0.0.0.0' || HOST === '::' ? 'localhost' : HOST;
+  console.log(`\n  Automation Test Platform → http://${shown}:${PORT}\n`);
   for (const suite of Object.values(SUITES)) {
     if (suite.frameworks) {
       const labels = suite.frameworks.map((f) => (frameworks.has(f.id) ? frameworks.get(f.id).label : f.id));
@@ -556,13 +684,25 @@ app.listen(PORT, () => {
   if (seededAdmin && seededAdmin.password) {
     console.warn('  ┌──────────────────────────────────────────────────────────┐');
     console.warn('  │  No users existed, so a first admin account was created. │');
+    console.warn('  │  This password is shown once and is not stored anywhere  │');
+    console.warn('  │  in readable form. You must change it at first sign-in.  │');
     console.warn(`  │    username: ${seededAdmin.username.padEnd(44)}│`);
     console.warn(`  │    password: ${seededAdmin.password.padEnd(44)}│`);
-    console.warn('  │  Change it from the Users tab after signing in.          │');
     console.warn('  └──────────────────────────────────────────────────────────┘\n');
+  }
+
+  // Loopback is the default for a reason; leaving it deserves a word about
+  // what now has to be true for that to be safe.
+  if (HOST !== '127.0.0.1' && HOST !== 'localhost' && HOST !== '::1') {
+    console.warn(
+      `  ⚠ Listening on ${HOST} — this dashboard is reachable beyond this machine.\n` +
+        '    It holds admin credentials for every site it can test, so put it behind\n' +
+        '    HTTPS and set TRUST_PROXY so session cookies are marked Secure.\n'
+    );
   }
   /* eslint-enable no-console */
 });
+}
 
 /* ------------------------------- shutdown --------------------------------- */
 // Stopping the dashboard must not orphan in-flight Playwright runs (they can run

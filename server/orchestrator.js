@@ -97,6 +97,48 @@ function orderTargets(targets) {
     .map((x) => x.t);
 }
 
+/* ------------------------------ request hygiene ---------------------------- */
+
+/**
+ * Which environment variables a *requested* target may set.
+ *
+ * A target arrives in an HTTP body — from the Run tab, or out of a saved
+ * schedule, both of which any account holding `tests.run` can shape. Whatever
+ * it contains is merged into the environment of a child process we then spawn.
+ * Merged unfiltered, that is a remote code execution primitive and not a
+ * subtle one: `NODE_OPTIONS=--require /tmp/x.js` runs arbitrary code as
+ * whoever owns the dashboard, and `CYPRESS_RUN_BINARY` / `PATH` / `LD_PRELOAD`
+ * each get you there by a different road.
+ *
+ * So: an allowlist, not a denylist. These are the namespaces the suites
+ * themselves read (see config.siteEnv), and nothing outside them gets through.
+ * Environment declared on a *suite* in sites.config.json is exempt — that file
+ * is local operator config, not user input.
+ */
+const ENV_ALLOWED_PREFIXES = ['E2E_', 'WP_', 'TEST_', 'DASHBOARD_'];
+const ENV_ALLOWED_EXACT = new Set(['PLAYWRIGHT_BASE_URL']);
+
+function sanitiseRequestedEnv(raw, suiteName) {
+  const out = {};
+  for (const [key, value] of Object.entries(raw || {})) {
+    const name = String(key);
+    const allowed =
+      ENV_ALLOWED_EXACT.has(name) || ENV_ALLOWED_PREFIXES.some((p) => name.startsWith(p));
+    if (!allowed) {
+      throw new Error(
+        `"${name}" is not an environment variable a run may set. Allowed: ` +
+          `${ENV_ALLOWED_PREFIXES.map((p) => p + '*').join(', ')}. ` +
+          `Suite-wide variables belong in sites.config.json under "${suiteName}".`
+      );
+    }
+    if (value !== null && typeof value === 'object') {
+      throw new Error(`Environment variable "${name}" must be a string.`);
+    }
+    out[name] = String(value == null ? '' : value);
+  }
+  return out;
+}
+
 /* --------------------------------- starting -------------------------------- */
 
 /**
@@ -109,14 +151,14 @@ function orderTargets(targets) {
  * against the same site. That's what makes "run the whole suite" run every
  * framework in it fully, not just whichever one the config happened to name.
  */
-function resolveTarget(t, runDir) {
+function resolveTarget(t, runDir, opts) {
   const suiteKey = t.suite || DEFAULT_SUITE;
   const suite = SUITES[suiteKey];
   if (!suite) throw new Error(`Unknown suite: ${t.suite}`);
   if (!suite.ok) throw new Error(`Suite "${suite.name}" is not runnable: ${suite.reason}`);
 
-  if (suite.frameworks) return resolveCompositeTargets(suite, t, runDir);
-  return [resolveSingleTarget(suite, t, runDir)];
+  if (suite.frameworks) return resolveCompositeTargets(suite, t, runDir, opts);
+  return [resolveSingleTarget(suite, t, runDir, null, opts)];
 }
 
 /**
@@ -128,7 +170,7 @@ function resolveTarget(t, runDir) {
  * every runnable member framework, run in full — the safe default for
  * "nothing more specific was said."
  */
-function resolveCompositeTargets(suite, t, runDir) {
+function resolveCompositeTargets(suite, t, runDir, opts) {
   const runnable = suite.frameworks.filter((f) => f.layout && f.layout.ok);
   if (!runnable.length) throw new Error(`Suite "${suite.name}" has no runnable framework.`);
 
@@ -151,7 +193,8 @@ function resolveCompositeTargets(suite, t, runDir) {
       suite,
       { ...t, paths: rel.length ? rel : undefined },
       runDir,
-      { framework: id }
+      { framework: id },
+      opts
     ));
   }
   if (!out.length) throw new Error(`No runnable framework matched the selection for "${suite.name}".`);
@@ -165,13 +208,30 @@ function resolveCompositeTargets(suite, t, runDir) {
  * a composite suite; omitted for a plain single-framework suite, which reads
  * both off the suite itself exactly as before.
  */
-function resolveSingleTarget(suite, t, runDir, member) {
+function resolveSingleTarget(suite, t, runDir, member, opts = {}) {
   const suiteKey = t.suite || DEFAULT_SUITE;
   const framework = member ? member.framework : suite.framework;
 
-  const custom = !!t.baseUrl && !SITES[t.site];
+  // A "custom" target carries its own URL and credentials instead of naming a
+  // registered site. Only the PR Builder legitimately does that (it tests a
+  // site it just built, which is in no config), and it passes trusted:true.
+  //
+  // Honouring it from an HTTP body would let anyone with `tests.run` aim a
+  // suite — and whatever credentials it is handed — at a host of their
+  // choosing, which is both an exfiltration channel and a way to make this
+  // server attack things it can reach and the caller cannot.
+  const wantsCustom = !!t.baseUrl && !SITES[t.site];
+  if (wantsCustom && !opts.trusted) {
+    throw new Error(
+      `Unknown site: ${t.site}. Runs may only target a site registered on the Sites tab.`
+    );
+  }
+  const custom = wantsCustom;
   const site = SITES[t.site];
   if (!custom && !site) throw new Error(`Unknown site: ${t.site}`);
+  if (site && site.credentialError) {
+    throw new Error(`Site "${site.name}": ${site.credentialError}`);
+  }
 
   const adapter = frameworks.get(framework);
   const key = targetKey(suiteKey, t.site, member ? framework : null);
@@ -187,13 +247,27 @@ function resolveSingleTarget(suite, t, runDir, member) {
 
   // A custom target isn't in the sites config, so its credentials come from the
   // caller (the PR Builder) rather than from a registered site.
-  const adminUser = custom ? (t.env || {}).E2E_ADMIN_USER || 'admin' : site.adminUser;
-  const adminPass = custom ? (t.env || {}).E2E_ADMIN_PASS || 'admin' : site.adminPass;
+  const requestedEnv = opts.trusted
+    ? { ...(t.env || {}) }
+    : sanitiseRequestedEnv(t.env, suite.name);
+  const adminUser = custom ? requestedEnv.E2E_ADMIN_USER || 'admin' : site.adminUser;
+  const adminPass = custom ? requestedEnv.E2E_ADMIN_PASS : site.adminPass;
+
+  // No credentials means the run would try admin/admin against whatever the
+  // URL points at. Fail here, where the reason can be stated, instead of
+  // leaving someone to read a failed login out of a Selenium stack trace.
+  if (!adminPass) {
+    throw new Error(
+      custom
+        ? 'No admin password was supplied for this target.'
+        : `Site "${site.name}" has no admin password set. Add one on the Sites tab.`
+    );
+  }
 
   spawnEnvs.set(`${runDir.id}:${key}`, {
     ...siteEnv({ url: baseUrl, adminUser, adminPass }),
     ...suite.env,
-    ...(t.env || {}),
+    ...requestedEnv,
     // Legacy: suites that pick their environment by name rather than by URL.
     TEST_SITE: t.site,
     DASHBOARD_SITE: t.site,
@@ -239,19 +313,22 @@ function resolveSingleTarget(suite, t, runDir, member) {
  * @param {string} [label]
  * @returns {{id:string}}
  */
-function startRun(targets, label) {
+function startRun(targets, label, { trusted = false } = {}) {
   if (!Array.isArray(targets) || targets.length === 0) {
     throw new Error('No targets selected.');
   }
 
   const id = makeRunId();
   const dir = store.runDir(id);
-  store.ensureDir(dir);
 
   // A composite suite's one requested target can resolve into several (one
   // per member framework — see resolveCompositeTargets), so the busy-guard has
   // to run against the resolved keys, not the requested ones.
-  const resolved = targets.flatMap((t) => resolveTarget(t, { id, dir }));
+  //
+  // Resolve and check before creating the directory: both are where a request
+  // gets rejected, and doing it the other way round left an empty run
+  // directory on disk for every rejection.
+  const resolved = targets.flatMap((t) => resolveTarget(t, { id, dir }, { trusted }));
 
   // One run per (suite, site[, framework]) at a time: two runs fighting over
   // the same target would fight over its site's state, but the *same* suite
@@ -265,6 +342,8 @@ function startRun(targets, label) {
       );
     }
   }
+
+  store.ensureDir(dir);
 
   const run = {
     id,
@@ -458,8 +537,10 @@ function specContext(target, runId) {
     authLog: target.authLog,
     reporterPath: REPORTER_PATHS[target.framework],
     baseUrl: target.baseUrl,
-    adminUser: env.E2E_ADMIN_USER || 'admin',
-    adminPass: env.E2E_ADMIN_PASS || 'admin',
+    // No "or admin" default: resolveSingleTarget already refused a target
+    // without credentials, and quietly substituting a guess here would undo it.
+    adminUser: env.E2E_ADMIN_USER || '',
+    adminPass: env.E2E_ADMIN_PASS || '',
     siteKey: target.site,
   };
 }
@@ -1125,6 +1206,7 @@ function recoverInterrupted() {
 
 module.exports = {
   events,
+  sanitiseRequestedEnv,
   startRun,
   cancelRun,
   cancelTarget,

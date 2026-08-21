@@ -94,6 +94,15 @@ function validateInput(data) {
   if (!Array.isArray(data.targets) || data.targets.length === 0) {
     throw new Error('At least one target site is required.');
   }
+  // A schedule is a run request in cold storage — same rules, checked now
+  // rather than at 3am when the failure is a line in a log nobody reads.
+  for (const t of data.targets) {
+    if (!t || typeof t !== 'object') throw new Error('Each target must be an object.');
+    if (t.baseUrl) {
+      throw new Error('Schedules may only target a site registered on the Sites tab.');
+    }
+    orchestrator.sanitiseRequestedEnv(t.env, String(t.suite || 'the suite'));
+  }
 }
 
 function create(data) {
